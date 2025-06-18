@@ -32,11 +32,11 @@ impl S {
 
     /// 根据新元素更新 softmax 状态
     fn update(&mut self, x: f64) {
-        let old_max = self.current_max;
-        let new_max = f64::max(old_max, x);
-        *self = Self {
-            current_max: new_max,
-            sum_exp: self.sum_exp * (old_max - new_max).exp() + (x - new_max).exp(),
+        self.sum_exp = if x > self.current_max {
+            let old_max = std::mem::replace(&mut self.current_max, x);
+            self.sum_exp * (old_max - x).exp() + 1.
+        } else {
+            self.sum_exp + (x - self.current_max).exp()
         }
     }
 }

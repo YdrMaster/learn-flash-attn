@@ -7,12 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.1] - 2025-06-18
+
+### Changed
+
+- online softmax 用判断替换一次 exp；
+
 ## [0.0.0] - 2025-06-18
 
-### Add
+### Added
 
 - 创建项目；
 - 实现基本的 online softmax；
 
-[Unreleased]: https://github.com/InfiniTensor/gguf/compare/v0.0.0...HEAD
-[0.0.0]: https://github.com/InfiniTensor/gguf/releases/tag/v0.0.0
+[Unreleased]: https://github.com/YdrMaster/learn-flash-attn/compare/v0.0.1...HEAD
+[0.0.1]: https://github.com/YdrMaster/learn-flash-attn/compare/v0.0.0...v0.0.1
+[0.0.0]: https://github.com/YdrMaster/learn-flash-attn/releases/tag/v0.0.0

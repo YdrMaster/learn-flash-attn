@@ -5,13 +5,16 @@ pub fn online_softmax(data: &mut [f64]) {
     // 一次遍历，同时确定最大值和指数和
     let mut s = S::EMPTY;
     for &x in &*data {
-        s.update(x)
+        s = S::reduce(
+            s,
+            S {
+                max: x,
+                sum_exp: 1.,
+            },
+        )
     }
 
-    let S {
-        current_max: max,
-        sum_exp: sum,
-    } = s;
+    let S { max, sum_exp: sum } = s;
 
     // 归一化
     for x in data {
@@ -19,25 +22,22 @@ pub fn online_softmax(data: &mut [f64]) {
     }
 }
 
+#[derive(Clone, Copy)]
 struct S {
-    current_max: f64,
+    max: f64,
     sum_exp: f64,
 }
 
 impl S {
     const EMPTY: Self = Self {
-        current_max: f64::NEG_INFINITY,
+        max: f64::NEG_INFINITY,
         sum_exp: 0.,
     };
 
-    /// 根据新元素更新 softmax 状态
-    fn update(&mut self, x: f64) {
-        self.sum_exp = if x > self.current_max {
-            let old_max = std::mem::replace(&mut self.current_max, x);
-            self.sum_exp * (old_max - x).exp() + 1.
-        } else {
-            self.sum_exp + (x - self.current_max).exp()
-        }
+    fn reduce(a: Self, b: Self) -> Self {
+        let max = f64::max(a.max, b.max);
+        let sum_exp = a.sum_exp * (a.max - max).exp() + b.sum_exp * (b.max - max).exp();
+        Self { max, sum_exp }
     }
 }
 

@@ -1,20 +1,18 @@
 ﻿//! READ: <https://zhuanlan.zhihu.com/p/11656282335>
 
 /// 增量 softmax 实现
-pub fn online_softmax(data: &mut [f64]) {
+pub fn online_softmax(data: &mut [f64], block_size: usize) {
     // 一次遍历，同时确定最大值和指数和
-    let mut s = S::EMPTY;
-    for &x in &*data {
-        s = S::reduce(
-            s,
-            S {
-                max: x,
-                sum_exp: 1.,
-            },
-        )
+    let mut s = S::new(&[]);
+
+    let mut slice = &data[..];
+    while slice.len() > block_size {
+        let (block, slice_) = slice.split_at(block_size);
+        s = S::reduce(s, S::new(block));
+        slice = slice_
     }
 
-    let S { max, sum_exp: sum } = s;
+    let S { max, sum_exp: sum } = S::reduce(s, S::new(slice));
 
     // 归一化
     for x in data {
@@ -29,15 +27,28 @@ struct S {
 }
 
 impl S {
-    const EMPTY: Self = Self {
-        max: f64::NEG_INFINITY,
-        sum_exp: 0.,
-    };
+    fn new(data: &[f64]) -> Self {
+        let max = data.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let sum_exp = data.iter().map(|x| (x - max).exp()).sum();
+        Self { max, sum_exp }
+    }
 
     fn reduce(a: Self, b: Self) -> Self {
-        let max = f64::max(a.max, b.max);
-        let sum_exp = a.sum_exp * (a.max - max).exp() + b.sum_exp * (b.max - max).exp();
-        Self { max, sum_exp }
+        use std::cmp::Ordering::{Equal, Greater, Less};
+        let [l, g] = match a.max.total_cmp(&b.max) {
+            Equal => {
+                return Self {
+                    max: a.max,
+                    sum_exp: a.sum_exp + b.sum_exp,
+                };
+            }
+            Less => [a, b],
+            Greater => [b, a],
+        };
+        Self {
+            max: g.max,
+            sum_exp: l.sum_exp * (l.max - g.max).exp() + g.sum_exp,
+        }
     }
 }
 
@@ -58,7 +69,7 @@ mod tests {
 
         // 计算 online softmax
         let mut data = data;
-        online_softmax(&mut data);
+        online_softmax(&mut data, 32);
 
         for (ans, res) in zip(ans, data) {
             assert!((ans - res).abs() < f64::EPSILON)

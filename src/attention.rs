@@ -1,6 +1,6 @@
 ﻿use crate::softmax::S;
 use any_tensor::digit_layout::types;
-use std::{iter::zip, mem::replace};
+use std::iter::zip;
 
 macro_rules! destruct {
     ($pat:pat = $slice:expr) => {
@@ -37,6 +37,7 @@ pub fn flash_attention(
 
     let g = h / kvh;
     let scale = (d as f64).sqrt().recip();
+    let mut score = vec![0.; tile_ctx];
     // 处理每个头
     for i in 0..h {
         let q = q.as_deref().transform(|layout| layout.index(0, i));
@@ -45,41 +46,80 @@ pub fn flash_attention(
         let mut o = o.as_deref_mut().transform(|layout| layout.index(0, i));
 
         // 处理每个 token
-        'seq: for i in 0..n.div_ceil(tile_seq) {
+        for i in 0..n.div_ceil(tile_seq) {
             for j in 0..tile_ctx {
                 let i = i * tile_ctx + j;
                 if i >= n {
-                    continue 'seq;
+                    break;
                 }
 
                 let q = array::<f64>(q.as_deref().transform(|layout| layout.index(0, i)));
                 let o = array_mut::<f64>(o.as_deref_mut().transform(|layout| layout.index(0, i)));
                 o.fill(0.);
 
+                score.fill(0.);
+
                 let len = s - n + i + 1;
                 let mut s = S::new(&[]);
-                'ctx: for i in 0..len.div_ceil(tile_ctx) {
+                for i in 0..len.div_ceil(tile_ctx) {
                     for j in 0..tile_ctx {
                         let i = i * tile_ctx + j;
                         if i >= len {
-                            continue 'ctx;
+                            break;
                         }
 
                         let k = array::<f64>(k.as_deref().transform(|layout| layout.index(0, i)));
-                        let v = array::<f64>(v.as_deref().transform(|layout| layout.index(0, i)));
                         // score = q @ k^T / √d
-                        let score = zip(q, k).map(|(q, k)| q * k).sum::<f64>() * scale;
+                        score[j] = zip(q, k).map(|(q, k)| q * k).sum::<f64>() * scale;
+                    }
+
+                    // let max = score
+                    //     .iter()
+                    //     .copied()
+                    //     .chain([s.max])
+                    //     .fold(f64::NEG_INFINITY, f64::max);
+                    // let sum = [
+                    //     s.sum_exp * (s.max - max).exp(),
+                    //     score.iter().map(|x| (x - max).exp()).sum(),
+                    // ];
+
+                    // s.max = max;
+                    // s.sum_exp = sum[0] + sum[1];
+                    // let scale = sum.map(|x| x / s.sum_exp);
+
+                    // for j in 0..tile_ctx {
+                    //     let i = i * tile_ctx + j;
+                    //     if i >= len {
+                    //         break;
+                    //     }
+
+                    //     let v = array::<f64>(v.as_deref().transform(|layout| layout.index(0, i)));
+                    //     for (v, o) in zip(v, &mut *o) {
+                    //         *o = *o * scale[0] + *v * scale[1]
+                    //     }
+                    // }
+
+                    for j in 0..tile_ctx {
+                        let i = i * tile_ctx + j;
+                        if i >= len {
+                            break;
+                        }
 
                         use std::cmp::Ordering::{Equal, Greater, Less};
-                        let sum = match s.max.total_cmp(&score) {
+                        let sum = match s.max.total_cmp(&score[j]) {
                             Equal => [s.sum_exp, 1.],
-                            Greater => [s.sum_exp, (score - s.max).exp()],
-                            Less => [s.sum_exp * (replace(&mut s.max, score) - score).exp(), 1.],
+                            Greater => [s.sum_exp, (score[j] - s.max).exp()],
+                            Less => [
+                                s.sum_exp
+                                    * (std::mem::replace(&mut s.max, score[j]) - score[j]).exp(),
+                                1.,
+                            ],
                         };
 
                         s.sum_exp = sum[0] + sum[1];
-
                         let scale = sum.map(|x| x / s.sum_exp);
+
+                        let v = array::<f64>(v.as_deref().transform(|layout| layout.index(0, i)));
                         for (v, o) in zip(v, &mut *o) {
                             *o = *o * scale[0] + *v * scale[1]
                         }

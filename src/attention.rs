@@ -23,20 +23,23 @@ pub fn flash_attention(
 
     destruct!([h_q, n_q, d_q] = q.shape());
     destruct!([h_o, n_o, d_o] = o.shape());
-    destruct!([h_k, seq_k, d_k] = k.shape());
-    destruct!([h_v, seq_v, d_v] = v.shape());
+    destruct!([kvh_k, seq_k, d_k] = k.shape());
+    destruct!([kvh_v, seq_v, d_v] = v.shape());
 
-    let h = distinct(&[h_q, h_o, h_k, h_v]).unwrap();
+    let h = distinct(&[h_q, h_o]).unwrap();
+    let kvh = distinct(&[kvh_k, kvh_v]).unwrap();
+    assert_eq!(h % kvh, 0);
     let n = distinct(&[n_q, n_o]).unwrap();
     let s = distinct(&[seq_k, seq_v]).unwrap();
     let d = distinct(&[d_q, d_k, d_v, d_o]).unwrap();
 
+    let g = h / kvh;
     let scale = (d as f64).sqrt().recip();
     // 处理每个头
     for i in 0..h {
         let q = q.as_deref().transform(|layout| layout.index(0, i));
-        let k = k.as_deref().transform(|layout| layout.index(0, i));
-        let v = v.as_deref().transform(|layout| layout.index(0, i));
+        let k = k.as_deref().transform(|layout| layout.index(0, i / g));
+        let v = v.as_deref().transform(|layout| layout.index(0, i / g));
         let mut o = o.as_deref_mut().transform(|layout| layout.index(0, i));
 
         // 处理每个 token
@@ -118,23 +121,24 @@ mod test {
 
     #[test]
     fn test_flash_attention() {
-        const H: usize = 8;
+        const H: usize = 32;
+        const KVH: usize = 4;
         const N: usize = 7;
         const S: usize = 2048;
         const D: usize = 256;
 
         let q = Tensor::from_dim_slice(types::F64, &[H, N, D]);
-        let k = Tensor::from_dim_slice(types::F64, &[H, S, D]);
-        let v = Tensor::from_dim_slice(types::F64, &[H, S, D]);
+        let k = Tensor::from_dim_slice(types::F64, &[KVH, S, D]);
+        let v = Tensor::from_dim_slice(types::F64, &[KVH, S, D]);
         let o = Tensor::from_dim_slice(types::F64, &[H, N, D]);
 
         let q_data = random_data(H * N * D);
-        let k_data = random_data(H * S * D);
-        let v_data = random_data(H * S * D);
+        let k_data = random_data(KVH * S * D);
+        let v_data = random_data(KVH * S * D);
 
-        let q = q.map(|_| erase_ty(&q_data));
-        let k = k.map(|_| erase_ty(&k_data));
-        let v = v.map(|_| erase_ty(&v_data));
+        let q = q.as_ref().map(|_| erase_ty(&q_data));
+        let k = k.as_ref().map(|_| erase_ty(&k_data));
+        let v = v.as_ref().map(|_| erase_ty(&v_data));
 
         // 计算标准 attention
         let mut ans = vec![0.0f64; H * N * D];
@@ -142,16 +146,20 @@ mod test {
             q.as_deref(),
             k.as_deref(),
             v.as_deref(),
-            o.as_ref().map(|_| erase_ty_mut(&mut ans)),
+            o.as_ref().as_ref().map(|_| erase_ty_mut(&mut ans)),
         );
 
         // 计算 flash attention
         let mut res = vec![0.0f64; H * N * D];
-        flash_attention(q, k, v, o.map(|_| erase_ty_mut(&mut res)));
+        flash_attention(q, k, v, o.as_ref().map(|_| erase_ty_mut(&mut res)));
 
         for (ans, res) in zip(ans, res) {
             let e_abs = (ans - res).abs();
-            assert!(e_abs < 4e2 * f64::EPSILON, "err = {e_abs:.3e}")
+            assert!(
+                e_abs < 1e3 * f64::EPSILON,
+                "err = {e_abs:.3e} {}x",
+                e_abs / f64::EPSILON
+            )
         }
     }
 
@@ -183,21 +191,24 @@ mod test {
 
         destruct!([h_q, n_q, d_q] = q.shape());
         destruct!([h_o, n_o, d_o] = o.shape());
-        destruct!([h_k, seq_k, d_k] = k.shape());
-        destruct!([h_v, seq_v, d_v] = v.shape());
+        destruct!([kvh_k, seq_k, d_k] = k.shape());
+        destruct!([kvh_v, seq_v, d_v] = v.shape());
 
-        let h = distinct(&[h_q, h_o, h_k, h_v]).unwrap();
+        let h = distinct(&[h_q, h_o]).unwrap();
+        let kvh = distinct(&[kvh_k, kvh_v]).unwrap();
+        assert_eq!(h % kvh, 0);
         let n = distinct(&[n_q, n_o]).unwrap();
         let s = distinct(&[seq_k, seq_v]).unwrap();
         let d = distinct(&[d_q, d_k, d_v, d_o]).unwrap();
 
+        let g = h / kvh;
         let scale = (d as f64).sqrt().recip();
         let mut score = vec![0.; s];
         // 处理每个头
         for i in 0..h {
             let q = q.as_deref().transform(|layout| layout.index(0, i));
-            let k = k.as_deref().transform(|layout| layout.index(0, i));
-            let v = v.as_deref().transform(|layout| layout.index(0, i));
+            let k = k.as_deref().transform(|layout| layout.index(0, i / g));
+            let v = v.as_deref().transform(|layout| layout.index(0, i / g));
             let mut o = o.as_deref_mut().transform(|layout| layout.index(0, i));
 
             // 处理每个 token

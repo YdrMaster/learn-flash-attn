@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- 支持多头注意力；
+- 支持 GQA；
 
 ## [0.0.4] - 2025-06-19
 

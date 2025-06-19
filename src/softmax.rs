@@ -53,7 +53,7 @@ impl S {
 }
 
 #[cfg(test)]
-mod tests {
+pub mod test {
     use super::*;
     use std::iter::zip;
 
@@ -77,7 +77,7 @@ mod tests {
     }
 
     /// 标准 softmax 实现
-    fn safe_softmax(data: &mut [f64]) {
+    pub fn safe_softmax(data: &mut [f64]) {
         // 找到最大值以提高数值稳定性
         let mut max = f64::NEG_INFINITY;
         for &x in &*data {

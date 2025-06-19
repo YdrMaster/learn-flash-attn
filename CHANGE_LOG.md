@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- 添加 attention 实现、测试框架和 flash attention 接口；
+
 ## [0.0.3] - 2025-06-19
 
 ### Changed

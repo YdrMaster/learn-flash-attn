@@ -15,6 +15,8 @@ pub fn flash_attention(
     k: Tensor<&[u8]>,
     v: Tensor<&[u8]>,
     mut o: Tensor<&mut [u8]>,
+    tile_seq: usize,
+    tile_ctx: usize,
 ) {
     assert_eq!(q.dt(), types::F64);
     assert_eq!(k.dt(), types::F64);
@@ -43,32 +45,45 @@ pub fn flash_attention(
         let mut o = o.as_deref_mut().transform(|layout| layout.index(0, i));
 
         // 处理每个 token
-        for i in 0..n {
-            let q = array::<f64>(q.as_deref().transform(|layout| layout.index(0, i)));
-            let o = array_mut::<f64>(o.as_deref_mut().transform(|layout| layout.index(0, i)));
+        'seq: for i in 0..n.div_ceil(tile_seq) {
+            for j in 0..tile_ctx {
+                let i = i * tile_ctx + j;
+                if i >= n {
+                    continue 'seq;
+                }
 
-            o.fill(0.);
+                let q = array::<f64>(q.as_deref().transform(|layout| layout.index(0, i)));
+                let o = array_mut::<f64>(o.as_deref_mut().transform(|layout| layout.index(0, i)));
+                o.fill(0.);
 
-            let len = s - n + i + 1;
-            let mut s = S::new(&[]);
-            for i in 0..len {
-                let k = array::<f64>(k.as_deref().transform(|layout| layout.index(0, i)));
-                let v = array::<f64>(v.as_deref().transform(|layout| layout.index(0, i)));
-                // score = q @ k^T / √d
-                let score = zip(q, k).map(|(q, k)| q * k).sum::<f64>() * scale;
+                let len = s - n + i + 1;
+                let mut s = S::new(&[]);
+                'ctx: for i in 0..len.div_ceil(tile_ctx) {
+                    for j in 0..tile_ctx {
+                        let i = i * tile_ctx + j;
+                        if i >= len {
+                            continue 'ctx;
+                        }
 
-                use std::cmp::Ordering::{Equal, Greater, Less};
-                let sum = match s.max.total_cmp(&score) {
-                    Equal => [s.sum_exp, 1.],
-                    Greater => [s.sum_exp, (score - s.max).exp()],
-                    Less => [s.sum_exp * (replace(&mut s.max, score) - score).exp(), 1.],
-                };
+                        let k = array::<f64>(k.as_deref().transform(|layout| layout.index(0, i)));
+                        let v = array::<f64>(v.as_deref().transform(|layout| layout.index(0, i)));
+                        // score = q @ k^T / √d
+                        let score = zip(q, k).map(|(q, k)| q * k).sum::<f64>() * scale;
 
-                s.sum_exp = sum[0] + sum[1];
+                        use std::cmp::Ordering::{Equal, Greater, Less};
+                        let sum = match s.max.total_cmp(&score) {
+                            Equal => [s.sum_exp, 1.],
+                            Greater => [s.sum_exp, (score - s.max).exp()],
+                            Less => [s.sum_exp * (replace(&mut s.max, score) - score).exp(), 1.],
+                        };
 
-                let scale = sum.map(|x| x / s.sum_exp);
-                for (v, o) in zip(v, &mut *o) {
-                    *o = *o * scale[0] + *v * scale[1]
+                        s.sum_exp = sum[0] + sum[1];
+
+                        let scale = sum.map(|x| x / s.sum_exp);
+                        for (v, o) in zip(v, &mut *o) {
+                            *o = *o * scale[0] + *v * scale[1]
+                        }
+                    }
                 }
             }
         }
@@ -151,7 +166,7 @@ mod test {
 
         // 计算 flash attention
         let mut res = vec![0.0f64; H * N * D];
-        flash_attention(q, k, v, o.as_ref().map(|_| erase_ty_mut(&mut res)));
+        flash_attention(q, k, v, o.as_ref().map(|_| erase_ty_mut(&mut res)), 32, 32);
 
         for (ans, res) in zip(ans, res) {
             let e_abs = (ans - res).abs();

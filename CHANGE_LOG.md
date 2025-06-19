@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - 支持 GQA；
+- 对 seq 和 ctx 维度分块；
 
 ## [0.0.4] - 2025-06-19
 

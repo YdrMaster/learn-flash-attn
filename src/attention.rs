@@ -1,6 +1,6 @@
 ﻿use crate::softmax::S;
 use any_tensor::digit_layout::types;
-use std::iter::zip;
+use std::{iter::zip, mem::replace};
 
 macro_rules! destruct {
     ($pat:pat = $slice:expr) => {
@@ -45,16 +45,19 @@ pub fn flash_attention(
             let v = array::<f64>(v.as_deref().transform(|layout| layout.index(0, i)));
             // score = q @ k^T / √d
             let score = zip(q, k).map(|(q, k)| q * k).sum::<f64>() * scale;
-            let s0 = s;
-            s.max = f64::max(s0.max, score);
 
-            let sum0 = s0.sum_exp * (s0.max - s.max).exp();
-            let sum1 = (score - s.max).exp();
+            use std::cmp::Ordering::{Equal, Greater, Less};
+            let sum = match s.max.total_cmp(&score) {
+                Equal => [s.sum_exp, 1.],
+                Greater => [s.sum_exp, (score - s.max).exp()],
+                Less => [s.sum_exp * (replace(&mut s.max, score) - score).exp(), 1.],
+            };
 
-            s.sum_exp = sum0 + sum1;
+            s.sum_exp = sum[0] + sum[1];
 
+            let scale = sum.map(|x| x / s.sum_exp);
             for (v, o) in zip(v, &mut *o) {
-                *o = *o * sum0 / s.sum_exp + sum1 / s.sum_exp * *v
+                *o = *o * scale[0] + *v * scale[1]
             }
         }
     }
@@ -137,10 +140,8 @@ mod test {
         flash_attention(q, k, v, o.map(|_| erase_ty_mut(&mut res)));
 
         for (ans, res) in zip(ans, res) {
-            assert!(
-                (ans - res).abs() < 400. * f64::EPSILON,
-                "ans = {ans:.3e}, res = {res:.3e}"
-            )
+            let e_abs = (ans - res).abs();
+            assert!(e_abs < 4e2 * f64::EPSILON, "err = {e_abs:.3e}")
         }
     }
 

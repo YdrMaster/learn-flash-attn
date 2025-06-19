@@ -21,19 +21,19 @@ pub fn online_softmax(data: &mut [f64], block_size: usize) {
 }
 
 #[derive(Clone, Copy)]
-struct S {
-    max: f64,
-    sum_exp: f64,
+pub struct S {
+    pub max: f64,
+    pub sum_exp: f64,
 }
 
 impl S {
-    fn new(data: &[f64]) -> Self {
+    pub fn new(data: &[f64]) -> Self {
         let max = data.iter().copied().fold(f64::NEG_INFINITY, f64::max);
         let sum_exp = data.iter().map(|x| (x - max).exp()).sum();
         Self { max, sum_exp }
     }
 
-    fn reduce(a: Self, b: Self) -> Self {
+    pub fn reduce(a: Self, b: Self) -> Self {
         use std::cmp::Ordering::{Equal, Greater, Less};
         let [l, g] = match a.max.total_cmp(&b.max) {
             Equal => {

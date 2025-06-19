@@ -1,4 +1,6 @@
-﻿use any_tensor::digit_layout::types;
+﻿use crate::softmax::S;
+use any_tensor::digit_layout::types;
+use std::iter::zip;
 
 macro_rules! destruct {
     ($pat:pat = $slice:expr) => {
@@ -8,7 +10,12 @@ macro_rules! destruct {
     };
 }
 
-pub fn flash_attention(q: Tensor<&[u8]>, k: Tensor<&[u8]>, v: Tensor<&[u8]>, o: Tensor<&mut [u8]>) {
+pub fn flash_attention(
+    q: Tensor<&[u8]>,
+    k: Tensor<&[u8]>,
+    v: Tensor<&[u8]>,
+    mut o: Tensor<&mut [u8]>,
+) {
     assert_eq!(q.dt(), types::F64);
     assert_eq!(k.dt(), types::F64);
     assert_eq!(v.dt(), types::F64);
@@ -24,6 +31,33 @@ pub fn flash_attention(q: Tensor<&[u8]>, k: Tensor<&[u8]>, v: Tensor<&[u8]>, o: 
     let d = distinct(&[d_q, d_k, d_v, d_o]).unwrap();
 
     let scale = (d as f64).sqrt().recip();
+    // 处理每个 token
+    for i in 0..n {
+        let q = array::<f64>(q.as_deref().transform(|layout| layout.index(0, i)));
+        let o = array_mut::<f64>(o.as_deref_mut().transform(|layout| layout.index(0, i)));
+
+        o.fill(0.);
+
+        let len = s - n + i + 1;
+        let mut s = S::new(&[]);
+        for i in 0..len {
+            let k = array::<f64>(k.as_deref().transform(|layout| layout.index(0, i)));
+            let v = array::<f64>(v.as_deref().transform(|layout| layout.index(0, i)));
+            // score = q @ k^T / √d
+            let score = zip(q, k).map(|(q, k)| q * k).sum::<f64>() * scale;
+            let s0 = s;
+            s.max = f64::max(s0.max, score);
+
+            let sum0 = s0.sum_exp * (s0.max - s.max).exp();
+            let sum1 = (score - s.max).exp();
+
+            s.sum_exp = sum0 + sum1;
+
+            for (v, o) in zip(v, &mut *o) {
+                *o = *o * sum0 / s.sum_exp + sum1 / s.sum_exp * *v
+            }
+        }
+    }
 }
 
 type Tensor<T> = any_tensor::Tensor<T, 3>;
@@ -69,13 +103,12 @@ fn array_mut<T: Copy>(tensor: Tensor<&mut [u8]>) -> &mut [T] {
 mod test {
     use super::*;
     use crate::softmax::test::safe_softmax;
-    use std::iter::zip;
 
     #[test]
     fn test_flash_attention() {
-        const N: usize = 1;
-        const S: usize = 2;
-        const D: usize = 4;
+        const N: usize = 7;
+        const S: usize = 2048;
+        const D: usize = 256;
 
         let q = Tensor::from_dim_slice(types::F64, &[N, D]);
         let k = Tensor::from_dim_slice(types::F64, &[S, D]);
@@ -104,7 +137,10 @@ mod test {
         flash_attention(q, k, v, o.map(|_| erase_ty_mut(&mut res)));
 
         for (ans, res) in zip(ans, res) {
-            // assert!((ans - res).abs() < f64::EPSILON)
+            assert!(
+                (ans - res).abs() < 400. * f64::EPSILON,
+                "ans = {ans:.3e}, res = {res:.3e}"
+            )
         }
     }
 

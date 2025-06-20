@@ -7,10 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.5]
+
 ### Changed
 
-- 支持 GQA；
-- 对 seq 和 ctx 维度分块；
+- 接口支持 GQA；
+- 实现 seq 和 ctx 维度分块并行的 flash attention；
 
 ## [0.0.4] - 2025-06-19
 
@@ -44,7 +46,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - 创建项目；
 - 实现基本的 online softmax；
 
-[Unreleased]: https://github.com/YdrMaster/learn-flash-attn/compare/v0.0.4...HEAD
+[Unreleased]: https://github.com/YdrMaster/learn-flash-attn/compare/v0.0.5...HEAD
+[0.0.5]: https://github.com/YdrMaster/learn-flash-attn/compare/v0.0.4...v0.0.5
 [0.0.4]: https://github.com/YdrMaster/learn-flash-attn/compare/v0.0.3...v0.0.4
 [0.0.3]: https://github.com/YdrMaster/learn-flash-attn/compare/v0.0.2...v0.0.3
 [0.0.2]: https://github.com/YdrMaster/learn-flash-attn/compare/v0.0.1...v0.0.2

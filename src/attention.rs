@@ -57,39 +57,36 @@ pub fn flash_attention(
 
                 for i in 0..len.div_ceil(tile_ctx) {
                     let tiled = tile(i, len, tile_ctx);
-                    let mut x = tiled
-                        .clone()
-                        .map(|i| {
-                            let k = array::<f64>(k.as_deref().transform(|l| l.index(0, i)));
-                            // score = q @ k^T / √d
-                            zip(q, k).map(|(q, k)| q * k).sum::<f64>() * scale
-                        })
-                        .collect::<Vec<_>>();
+                    let mut x = vec![0.; tiled.len()];
+
+                    // score = q @ k^T / √d
+                    for (x, i) in zip(&mut x, tiled.clone()) {
+                        let k = array::<f64>(k.as_deref().transform(|l| l.index(0, i)));
+                        *x = zip(q, k).map(|(q, k)| q * k).sum::<f64>() * scale
+                    }
 
                     let mi = x.iter().copied().fold(mi_1, f64::max);
                     for x in &mut *x {
                         *x = (*x - mi).exp()
                     }
 
-                    let exp = di_1 * (mi_1 - mi).exp();
+                    let mut exp = di_1 * (mi_1 - mi).exp();
                     let di = exp + x.iter().sum::<f64>();
 
                     mi_1 = mi;
                     di_1 = di;
 
-                    let exp = exp / di;
-                    for x in &mut *x {
-                        *x /= di
-                    }
+                    exp /= di;
+                    x.iter_mut().for_each(|x| *x /= di);
 
-                    for o in &mut *o {
-                        *o *= exp
-                    }
+                    let mut o_local = vec![0.; o.len()];
                     for (x, i) in zip(x, tiled) {
                         let v = array::<f64>(v.as_deref().transform(|l| l.index(0, i)));
-                        for (v, o) in zip(v, &mut *o) {
-                            *o += x * v
-                        }
+                        zip(v, &mut o_local).for_each(|(v, o)| *o += x * v)
+                    }
+
+                    for (o, o_) in zip(&mut *o, o_local) {
+                        *o = *o * exp + o_
                     }
                 }
             }

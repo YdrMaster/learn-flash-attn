@@ -45,7 +45,6 @@ pub fn flash_attention(
     let g = h / kvh;
     let scale = (d as f64).sqrt().recip();
 
-    assert_eq!(tile_ctx, tile_seq);
     assert_eq!(s % tile_ctx, 0);
 
     // global
@@ -64,7 +63,7 @@ pub fn flash_attention(
     // 计算注意力
     for i in 0..h {
         // local
-        let mut qi = vec![0.; tile_ctx * d]; // 暂存 q
+        let mut qi = vec![0.; tile_seq * d]; // 暂存 q
         let mut kj = vec![0.; tile_ctx * d]; // 暂存 k
         let mut vj = vec![0.; tile_ctx * d]; // 暂存 v
         let mut x = vec![0.; tile_ctx * tile_seq]; // 注意力分数
@@ -82,16 +81,17 @@ pub fn flash_attention(
             vj: &mut vj,
             x: &mut x,
             n,
+            s,
             d,
-            b: tile_ctx,
-            tr: n.div_ceil(tile_seq),
-            tc: s.div_ceil(tile_ctx),
+            bn: tile_seq,
+            bs: tile_ctx,
             scale,
         }
         .launch()
     }
 }
 
+/// NOTICE GQA 需要发射此 kernel，MHA 可以合并到计算
 fn cache_concat(
     k: &Tensor<&[u8]>,
     v: &Tensor<&[u8]>,
@@ -115,8 +115,6 @@ fn cache_concat(
     let _ = distinct(&[d_k, d_v, d_kc, d_vc]).unwrap();
     assert!(buf_k >= s && buf_v >= s);
 
-    // 连接 kv cache
-    // NOTICE GQA 需要发射 2 个，MHA 可以只发射 1 个
     for i in 0..kvh {
         let k = k.as_deref().transform(|l| l.index(0, i));
         let v = v.as_deref().transform(|l| l.index(0, i));
@@ -148,10 +146,10 @@ struct FlashAttentionBlock<'a> {
     x: &'a mut [f64],
 
     n: usize,
+    s: usize,
     d: usize,
-    b: usize,
-    tr: usize,
-    tc: usize,
+    bn: usize,
+    bs: usize,
     scale: f64,
 }
 
@@ -165,36 +163,41 @@ impl FlashAttentionBlock<'_> {
             mask, // [n, s]
             l,    // [s]
             m,    // [s]
-            qi,   // [b, d]
-            kj,   // [b, d]
-            vj,   // [b, d]
-            x,    // [b, b]
+            qi,   // [bn, d]
+            kj,   // [bs, d]
+            vj,   // [bs, d]
+            x,    // [bn, bs]
             n,
+            s,
             d,
-            b,
-            tr,
-            tc,
+            bn,
+            bs,
             scale,
         } = self;
 
-        for ikvb in 0..tc {
+        for ikvb in 0..s.div_ceil(bs) {
             // thread
-            for it in 0..b {
+            for mut it in 0..bn {
                 // 每个线程拷贝 k/v 的一行，拷贝整个 kv block 到 local memory
-                let ikv = ikvb * b + it;
-                let k = array::<f64>(k.as_deref().transform(|l| l.index(0, ikv)));
-                let v = array::<f64>(v.as_deref().transform(|l| l.index(0, ikv)));
-                kj[it * d..][..d].copy_from_slice(k);
-                vj[it * d..][..d].copy_from_slice(v);
+                let mut ikv = ikvb * bs + it;
+                while ikv < (ikvb + 1) * bs {
+                    let k = array::<f64>(k.as_deref().transform(|l| l.index(0, ikv)));
+                    let v = array::<f64>(v.as_deref().transform(|l| l.index(0, ikv)));
+                    ikv += bn;
+
+                    kj[it * d..][..d].copy_from_slice(k);
+                    vj[it * d..][..d].copy_from_slice(v);
+                    it += bn;
+                }
             }
             // thread
-            for it in 0..b {
+            for it in 0..bn {
                 let qi = &mut qi[it * d..][..d];
-                let x = &mut x[it * b..][..b];
+                let x = &mut x[it * bs..][..bs];
 
-                for iqb in 0..tr {
+                for iqb in 0..n.div_ceil(bn) {
                     // 每个线程计算 q 的一行
-                    let iq = iqb * b + it;
+                    let iq = iqb * bn + it;
                     if iq >= n {
                         break;
                     }
@@ -204,7 +207,7 @@ impl FlashAttentionBlock<'_> {
                     let mask = array::<u8>(mask.as_deref().transform(|l| l.index(0, iq)));
                     // load data
                     qi.copy_from_slice(q);
-                    let mask = &mask[ikvb * b..][..b];
+                    let mask = &mask[ikvb * bs..][..bs];
 
                     let mi_1 = m[iq];
                     let di_1 = l[iq];
@@ -348,7 +351,7 @@ mod test {
             kc.as_ref().map(|_| erase_ty_mut(&mut kc_res)),
             vc.as_ref().map(|_| erase_ty_mut(&mut vc_res)),
             P,
-            32,
+            4,
             32,
         );
 

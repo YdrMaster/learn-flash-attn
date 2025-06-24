@@ -59,10 +59,10 @@ pub fn flash_attention(
         let mut x = vec![0.; tile_ctx * tile_seq]; // 注意力分数
         // block 之间完全无关，可以以任意方式并行
         FlashAttentionBlock {
-            q: &q.as_deref().transform(|layout| layout.index(0, i)),
-            k: &k.as_deref().transform(|layout| layout.index(0, i / g)),
-            v: &v.as_deref().transform(|layout| layout.index(0, i / g)),
-            o: &mut o.as_deref_mut().transform(|layout| layout.index(0, i)),
+            q: &q.as_deref().transform(|l| l.index(0, i)),
+            k: &k.as_deref().transform(|l| l.index(0, i / g)),
+            v: &v.as_deref().transform(|l| l.index(0, i / g)),
+            o: &mut o.as_deref_mut().transform(|l| l.index(0, i)),
             mask: &mask.as_deref(),
             l: &mut l[i * s..][..s],
             m: &mut m[i * s..][..s],
@@ -124,40 +124,37 @@ impl FlashAttentionBlock<'_> {
             scale,
         } = self;
 
-        for j in 0..tc {
+        for ikvb in 0..tc {
             // thread
-            for tx in 0..b {
+            for it in 0..b {
                 // 每个线程拷贝 k/v 的一行，拷贝整个 kv block 到 local memory
-                let kj = &mut kj[tx * d..][..d];
-                let vj = &mut vj[tx * d..][..d];
-
-                let k = array::<f64>(k.as_deref().transform(|l| l.index(0, j * b + tx)));
-                let v = array::<f64>(v.as_deref().transform(|l| l.index(0, j * b + tx)));
-
-                kj.copy_from_slice(k);
-                vj.copy_from_slice(v);
+                let ikv = ikvb * b + it;
+                let k = array::<f64>(k.as_deref().transform(|l| l.index(0, ikv)));
+                let v = array::<f64>(v.as_deref().transform(|l| l.index(0, ikv)));
+                kj[it * d..][..d].copy_from_slice(k);
+                vj[it * d..][..d].copy_from_slice(v);
             }
             // thread
-            for tx in 0..b {
-                let qi = &mut qi[tx * d..][..d];
-                let x = &mut x[tx * b..][..b];
+            for it in 0..b {
+                let qi = &mut qi[it * d..][..d];
+                let x = &mut x[it * b..][..b];
 
-                for i in 0..tr {
-                    if i * b + tx >= n {
+                for iqb in 0..tr {
+                    // 每个线程计算 q 的一行
+                    let iq = iqb * b + it;
+                    if iq >= n {
                         break;
                     }
-                    // load q
-                    let q = array::<f64>(q.as_deref().transform(|l| l.index(0, i * b + tx)));
+                    // locate data
+                    let q = array::<f64>(q.as_deref().transform(|l| l.index(0, iq)));
+                    let o = array_mut::<f64>(o.as_deref_mut().transform(|l| l.index(0, iq)));
+                    let mask = array::<u8>(mask.as_deref().transform(|l| l.index(0, iq)));
+                    // load data
                     qi.copy_from_slice(q);
-                    // locate o
-                    let o =
-                        array_mut::<f64>(o.as_deref_mut().transform(|l| l.index(0, i * b + tx)));
-                    // locate mask
-                    let mask = array::<u8>(mask.as_deref().transform(|l| l.index(0, i * b + tx)));
-                    let mask = &mask[j * b..][..b];
+                    let mask = &mask[ikvb * b..][..b];
 
-                    let mi_1 = m[i * b + tx];
-                    let di_1 = l[i * b + tx];
+                    let mi_1 = m[iq];
+                    let di_1 = l[iq];
 
                     // score = q @ k^T / √d
                     let mut mi = mi_1;
@@ -180,8 +177,8 @@ impl FlashAttentionBlock<'_> {
                     let mut exp = di_1 * (mi_1 - mi).exp();
                     let di = exp + sum;
 
-                    m[i * b + tx] = mi;
-                    l[i * b + tx] = di;
+                    m[iq] = mi;
+                    l[iq] = di;
 
                     exp /= di;
                     x.iter_mut().for_each(|x| *x /= di);
@@ -331,19 +328,19 @@ mod test {
         let mut score = vec![0.; s];
         // 处理每个头
         for i in 0..h {
-            let q = q.as_deref().transform(|layout| layout.index(0, i));
-            let k = k.as_deref().transform(|layout| layout.index(0, i / g));
-            let v = v.as_deref().transform(|layout| layout.index(0, i / g));
-            let mut o = o.as_deref_mut().transform(|layout| layout.index(0, i));
+            let q = q.as_deref().transform(|l| l.index(0, i));
+            let k = k.as_deref().transform(|l| l.index(0, i / g));
+            let v = v.as_deref().transform(|l| l.index(0, i / g));
+            let mut o = o.as_deref_mut().transform(|l| l.index(0, i));
 
             // 处理每个 token
             for i in 0..n {
-                let q = array::<f64>(q.as_deref().transform(|layout| layout.index(0, i)));
-                let o = array_mut::<f64>(o.as_deref_mut().transform(|layout| layout.index(0, i)));
+                let q = array::<f64>(q.as_deref().transform(|l| l.index(0, i)));
+                let o = array_mut::<f64>(o.as_deref_mut().transform(|l| l.index(0, i)));
                 // score = q @ k^T / √d
                 let len = s - n + i + 1;
                 for (i, score) in score.iter_mut().enumerate().take(len) {
-                    let k = array::<f64>(k.as_deref().transform(|layout| layout.index(0, i)));
+                    let k = array::<f64>(k.as_deref().transform(|l| l.index(0, i)));
                     *score = zip(q, k).map(|(q, k)| q * k).sum::<f64>() * scale
                 }
                 // causal softmax
@@ -351,7 +348,7 @@ mod test {
                 // o = a @ v // 乘法不连续
                 o.fill(0.);
                 for (i, score) in score.iter().enumerate().take(len) {
-                    let v = array::<f64>(v.as_deref().transform(|layout| layout.index(0, i)));
+                    let v = array::<f64>(v.as_deref().transform(|l| l.index(0, i)));
                     for (v, o) in zip(v, &mut *o) {
                         *o += score * v
                     }

@@ -60,18 +60,21 @@ pub fn flash_attention(
                     let mut x = vec![0.; tiled.len()];
 
                     // score = q @ k^T / √d
+                    let mut mi = mi_1;
                     for (x, i) in zip(&mut x, tiled.clone()) {
                         let k = array::<f64>(k.as_deref().transform(|l| l.index(0, i)));
-                        *x = zip(q, k).map(|(q, k)| q * k).sum::<f64>() * scale
+                        *x = zip(q, k).map(|(q, k)| q * k).sum::<f64>() * scale;
+                        mi = f64::max(mi, *x)
                     }
 
-                    let mi = x.iter().copied().fold(mi_1, f64::max);
+                    let mut sum = 0.;
                     for x in &mut *x {
-                        *x = (*x - mi).exp()
+                        *x = (*x - mi).exp();
+                        sum += *x
                     }
 
                     let mut exp = di_1 * (mi_1 - mi).exp();
-                    let di = exp + x.iter().sum::<f64>();
+                    let di = exp + sum;
 
                     mi_1 = mi;
                     di_1 = di;
@@ -79,14 +82,13 @@ pub fn flash_attention(
                     exp /= di;
                     x.iter_mut().for_each(|x| *x /= di);
 
-                    let mut o_local = vec![0.; o.len()];
-                    for (x, i) in zip(x, tiled) {
+                    let mut xv = vec![0.; o.len()];
+                    for (i, x) in zip(tiled, x) {
                         let v = array::<f64>(v.as_deref().transform(|l| l.index(0, i)));
-                        zip(v, &mut o_local).for_each(|(v, o)| *o += x * v)
+                        zip(&mut xv, v).for_each(|(xv, v)| *xv += x * v)
                     }
-
-                    for (o, o_) in zip(&mut *o, o_local) {
-                        *o = *o * exp + o_
+                    for (o, xv) in zip(&mut *o, xv) {
+                        *o = *o * exp + xv
                     }
                 }
             }

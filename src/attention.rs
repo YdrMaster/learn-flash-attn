@@ -44,6 +44,13 @@ pub fn flash_attention(
     let mut l = vec![0.; h * s]; // 注意力分母
     let mut m = vec![f64::NEG_INFINITY; h * s]; // 最大值缓存
 
+    // causal mask
+    let mask = Tensor::from_dim_slice(types::Bool, &[n, s]).map(|len| {
+        (0..len)
+            .map(|i| if i % s <= s - n + i / s { 1u8 } else { 0u8 })
+            .collect::<Vec<_>>()
+    });
+
     for i in 0..h {
         // local
         let mut qi = vec![0.; tile_ctx * d]; // 暂存 q
@@ -56,6 +63,7 @@ pub fn flash_attention(
             k: &k.as_deref().transform(|layout| layout.index(0, i / g)),
             v: &v.as_deref().transform(|layout| layout.index(0, i / g)),
             o: &mut o.as_deref_mut().transform(|layout| layout.index(0, i)),
+            mask: &mask.as_deref(),
             l: &mut l[i * s..][..s],
             m: &mut m[i * s..][..s],
             qi: &mut qi,
@@ -78,6 +86,7 @@ struct FlashAttentionBlock<'a> {
     k: &'a Tensor<&'a [u8]>,
     v: &'a Tensor<&'a [u8]>,
     o: &'a mut Tensor<&'a mut [u8]>,
+    mask: &'a Tensor<&'a [u8]>,
     l: &'a mut [f64],
     m: &'a mut [f64],
     qi: &'a mut [f64],
@@ -96,16 +105,17 @@ struct FlashAttentionBlock<'a> {
 impl FlashAttentionBlock<'_> {
     fn launch(self) {
         let Self {
-            q,  // [n, d]
-            k,  // [s, d]
-            v,  // [s, d]
-            o,  // [n, d]
-            l,  // [s]
-            m,  // [s]
-            qi, // [b, d]
-            kj, // [b, d]
-            vj, // [b, d]
-            x,  // [b, b]
+            q,    // [n, d]
+            k,    // [s, d]
+            v,    // [s, d]
+            o,    // [n, d]
+            mask, // [n, s]
+            l,    // [s]
+            m,    // [s]
+            qi,   // [b, d]
+            kj,   // [b, d]
+            vj,   // [b, d]
+            x,    // [b, b]
             n,
             d,
             b,
@@ -136,21 +146,29 @@ impl FlashAttentionBlock<'_> {
                     if i * b + tx >= n {
                         break;
                     }
-
+                    // load q
                     let q = array::<f64>(q.as_deref().transform(|l| l.index(0, i * b + tx)));
+                    qi.copy_from_slice(q);
+                    // locate o
                     let o =
                         array_mut::<f64>(o.as_deref_mut().transform(|l| l.index(0, i * b + tx)));
-                    qi.copy_from_slice(q);
+                    // locate mask
+                    let mask = array::<u8>(mask.as_deref().transform(|l| l.index(0, i * b + tx)));
+                    let mask = &mask[j * b..][..b];
 
                     let mi_1 = m[i * b + tx];
                     let di_1 = l[i * b + tx];
 
                     // score = q @ k^T / √d
                     let mut mi = mi_1;
-                    for (y, x) in x.iter_mut().enumerate() {
-                        let kj = &kj[y * d..][..d];
-                        *x = zip(&*qi, kj).map(|(q, k)| q * k).sum::<f64>() * scale;
-                        mi = f64::max(mi, *x)
+                    for (y, (mask, x)) in zip(mask, &mut *x).enumerate() {
+                        if *mask == 0 {
+                            *x = f64::NEG_INFINITY
+                        } else {
+                            let kj = &kj[y * d..][..d];
+                            *x = zip(&*qi, kj).map(|(q, k)| q * k).sum::<f64>() * scale;
+                            mi = f64::max(mi, *x)
+                        }
                     }
 
                     let mut sum = 0.;
@@ -323,7 +341,7 @@ mod test {
                 let q = array::<f64>(q.as_deref().transform(|layout| layout.index(0, i)));
                 let o = array_mut::<f64>(o.as_deref_mut().transform(|layout| layout.index(0, i)));
                 // score = q @ k^T / √d
-                let len = s; // TODO causal: s - n + i + 1;
+                let len = s - n + i + 1;
                 for i in 0..len {
                     let k = array::<f64>(k.as_deref().transform(|layout| layout.index(0, i)));
                     score[i] = zip(q, k).map(|(q, k)| q * k).sum::<f64>() * scale

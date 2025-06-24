@@ -1,5 +1,5 @@
 ﻿use any_tensor::digit_layout::types;
-use std::{iter::zip, ops::Range};
+use std::iter::zip;
 
 macro_rules! destruct {
     ($pat:pat = $slice:expr) => {
@@ -14,8 +14,8 @@ pub fn flash_attention(
     k: Tensor<&[u8]>,
     v: Tensor<&[u8]>,
     mut o: Tensor<&mut [u8]>,
-    tile_seq: usize,
-    tile_ctx: usize,
+    tile_seq: usize, // = tile q  = Br
+    tile_ctx: usize, // = tile kv = Bc
 ) {
     assert_eq!(q.dt(), types::F64);
     assert_eq!(k.dt(), types::F64);
@@ -37,33 +37,113 @@ pub fn flash_attention(
     let g = h / kvh;
     let scale = (d as f64).sqrt().recip();
 
-    // 处理每个头
+    assert_eq!(n, s);
+    assert_eq!(tile_ctx, tile_seq);
+    assert_eq!(n % tile_ctx, 0);
+
+    // global
+    let mut l = vec![0.; h * s]; // 注意力分母（global）
+    let mut m = vec![f64::NEG_INFINITY; h * s]; // 最大值缓存（global）
+
     for i in 0..h {
-        let q = q.as_deref().transform(|layout| layout.index(0, i));
-        let k = k.as_deref().transform(|layout| layout.index(0, i / g));
-        let v = v.as_deref().transform(|layout| layout.index(0, i / g));
-        let mut o = o.as_deref_mut().transform(|layout| layout.index(0, i));
+        // local
+        let mut qi = vec![0.; tile_ctx * d]; // 暂存 q（shared）
+        let mut kj = vec![0.; tile_ctx * d]; // 暂存 k（shared）
+        let mut vj = vec![0.; tile_ctx * d]; // 暂存 v（shared）
+        let mut x = vec![0.; tile_ctx * tile_seq]; // 注意力分数（shared）
 
-        // 处理每个 token
-        for i in 0..n.div_ceil(tile_seq) {
-            for i in tile(i, n, tile_seq) {
-                let q = array::<f64>(q.as_deref().transform(|l| l.index(0, i)));
-                let o = array_mut::<f64>(o.as_deref_mut().transform(|l| l.index(0, i)));
-                o.fill(0.);
+        FlashAttentionBlock {
+            q: &q.as_deref().transform(|layout| layout.index(0, i)),
+            k: &k.as_deref().transform(|layout| layout.index(0, i / g)),
+            v: &v.as_deref().transform(|layout| layout.index(0, i / g)),
+            o: &mut o.as_deref_mut().transform(|layout| layout.index(0, i)),
+            l: &mut l[i * s..][..s],
+            m: &mut m[i * s..][..s],
+            qi: &mut qi,
+            kj: &mut kj,
+            vj: &mut vj,
+            x: &mut x,
+            d,
+            b: tile_ctx,
+            tr: n.div_ceil(tile_seq),
+            tc: s.div_ceil(tile_ctx),
+            scale,
+        }
+        .launch()
+    }
+}
 
-                let len = s - n + i + 1;
-                let mut mi_1 = f64::NEG_INFINITY;
-                let mut di_1 = 0.;
+struct FlashAttentionBlock<'a> {
+    q: &'a Tensor<&'a [u8]>,
+    k: &'a Tensor<&'a [u8]>,
+    v: &'a Tensor<&'a [u8]>,
+    o: &'a mut Tensor<&'a mut [u8]>,
+    l: &'a mut [f64],
+    m: &'a mut [f64],
+    qi: &'a mut [f64],
+    kj: &'a mut [f64],
+    vj: &'a mut [f64],
+    x: &'a mut [f64],
 
-                for i in 0..len.div_ceil(tile_ctx) {
-                    let tiled = tile(i, len, tile_ctx);
-                    let mut x = vec![0.; tiled.len()];
+    d: usize,
+    b: usize,
+    tr: usize,
+    tc: usize,
+    scale: f64,
+}
+
+impl FlashAttentionBlock<'_> {
+    fn launch(self) {
+        let Self {
+            q,  // [n, d]
+            k,  // [n, d]
+            v,  // [n, d]
+            o,  // [n, d]
+            l,  // [n]
+            m,  // [n]
+            qi, // [b, d]
+            kj, // [b, d]
+            vj, // [b, d]
+            x,  // [b, b]
+            d,
+            b,
+            tr,
+            tc,
+            scale,
+        } = self;
+
+        for j in 0..tc {
+            // thread
+            for tx in 0..b {
+                // 每个线程拷贝 k/v 的一行，拷贝整个 kv block 到 local memory
+                let kj = &mut kj[tx * d..][..d];
+                let vj = &mut vj[tx * d..][..d];
+
+                let k = array::<f64>(k.as_deref().transform(|l| l.index(0, j * b + tx)));
+                let v = array::<f64>(v.as_deref().transform(|l| l.index(0, j * b + tx)));
+
+                kj.copy_from_slice(k);
+                vj.copy_from_slice(v);
+            }
+            // thread
+            for tx in 0..b {
+                let qi = &mut qi[tx * d..][..d];
+                let x = &mut x[tx * b..][..b];
+
+                for i in 0..tr {
+                    let q = array::<f64>(q.as_deref().transform(|l| l.index(0, i * b + tx)));
+                    let o =
+                        array_mut::<f64>(o.as_deref_mut().transform(|l| l.index(0, i * b + tx)));
+                    qi.copy_from_slice(q);
+
+                    let mi_1 = m[i * b + tx];
+                    let di_1 = l[i * b + tx];
 
                     // score = q @ k^T / √d
                     let mut mi = mi_1;
-                    for (x, i) in zip(&mut x, tiled.clone()) {
-                        let k = array::<f64>(k.as_deref().transform(|l| l.index(0, i)));
-                        *x = zip(q, k).map(|(q, k)| q * k).sum::<f64>() * scale;
+                    for (y, x) in x.iter_mut().enumerate() {
+                        let kj = &kj[y * d..][..d];
+                        *x = zip(&*qi, kj).map(|(q, k)| q * k).sum::<f64>() * scale;
                         mi = f64::max(mi, *x)
                     }
 
@@ -76,18 +156,18 @@ pub fn flash_attention(
                     let mut exp = di_1 * (mi_1 - mi).exp();
                     let di = exp + sum;
 
-                    mi_1 = mi;
-                    di_1 = di;
+                    m[i * b + tx] = mi;
+                    l[i * b + tx] = di;
 
                     exp /= di;
                     x.iter_mut().for_each(|x| *x /= di);
 
                     let mut xv = vec![0.; o.len()];
-                    for (i, x) in zip(tiled, x) {
-                        let v = array::<f64>(v.as_deref().transform(|l| l.index(0, i)));
-                        zip(&mut xv, v).for_each(|(xv, v)| *xv += x * v)
+                    for (i, x) in x.iter().enumerate() {
+                        let vj = &vj[i * d..][..d];
+                        zip(&mut xv, vj).for_each(|(xv, v)| *xv += x * v)
                     }
-                    for (o, xv) in zip(&mut *o, xv) {
+                    for (o, xv) in zip(o, xv) {
                         *o = *o * exp + xv
                     }
                 }
@@ -135,11 +215,6 @@ fn array_mut<T: Copy>(tensor: Tensor<&mut [u8]>) -> &mut [T] {
     data
 }
 
-/// 产生分块的序号范围
-fn tile(i: usize, total: usize, tile: usize) -> Range<usize> {
-    i * tile..((i + 1) * tile).min(total)
-}
-
 #[cfg(test)]
 mod test {
     use super::*;
@@ -149,8 +224,8 @@ mod test {
     fn test_flash_attention() {
         const H: usize = 32;
         const KVH: usize = 4;
-        const N: usize = 7;
-        const S: usize = 2048;
+        const N: usize = 512;
+        const S: usize = 512;
         const D: usize = 256;
 
         let q = Tensor::from_dim_slice(types::F64, &[H, N, D]);
@@ -190,9 +265,7 @@ mod test {
     }
 
     fn random_data(n: usize) -> Vec<f64> {
-        (0..n)
-            .map(|_| (rand::random::<f64>() - 0.5) * 10.)
-            .collect()
+        (0..n).map(|i| (i as f64 * 0.1).sin() * 10.).collect()
     }
 
     fn erase_ty<T: Copy>(data: &[T]) -> &[u8] {
@@ -242,14 +315,13 @@ mod test {
                 let q = array::<f64>(q.as_deref().transform(|layout| layout.index(0, i)));
                 let o = array_mut::<f64>(o.as_deref_mut().transform(|layout| layout.index(0, i)));
                 // score = q @ k^T / √d
-                let len = s - n + i + 1;
+                let len = s; // TODO causal: s - n + i + 1;
                 for i in 0..len {
                     let k = array::<f64>(k.as_deref().transform(|layout| layout.index(0, i)));
                     score[i] = zip(q, k).map(|(q, k)| q * k).sum::<f64>() * scale
                 }
                 // causal softmax
                 safe_softmax(&mut score[..len]);
-                score[len..].fill(0.);
                 // o = a @ v // 乘法不连续
                 o.fill(0.);
                 for i in 0..len {

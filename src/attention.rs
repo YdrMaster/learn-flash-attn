@@ -29,29 +29,28 @@ pub fn flash_attention(
 
     let h = distinct(&[h_q, h_o]).unwrap();
     let kvh = distinct(&[kvh_k, kvh_v]).unwrap();
-    assert_eq!(h % kvh, 0);
     let n = distinct(&[n_q, n_o]).unwrap();
     let s = distinct(&[seq_k, seq_v]).unwrap();
     let d = distinct(&[d_q, d_k, d_v, d_o]).unwrap();
 
+    assert_eq!(h % kvh, 0);
     let g = h / kvh;
     let scale = (d as f64).sqrt().recip();
 
-    assert_eq!(n, s);
     assert_eq!(tile_ctx, tile_seq);
-    assert_eq!(n % tile_ctx, 0);
+    assert_eq!(s % tile_ctx, 0);
 
     // global
-    let mut l = vec![0.; h * s]; // 注意力分母（global）
-    let mut m = vec![f64::NEG_INFINITY; h * s]; // 最大值缓存（global）
+    let mut l = vec![0.; h * s]; // 注意力分母
+    let mut m = vec![f64::NEG_INFINITY; h * s]; // 最大值缓存
 
     for i in 0..h {
         // local
-        let mut qi = vec![0.; tile_ctx * d]; // 暂存 q（shared）
-        let mut kj = vec![0.; tile_ctx * d]; // 暂存 k（shared）
-        let mut vj = vec![0.; tile_ctx * d]; // 暂存 v（shared）
-        let mut x = vec![0.; tile_ctx * tile_seq]; // 注意力分数（shared）
-
+        let mut qi = vec![0.; tile_ctx * d]; // 暂存 q
+        let mut kj = vec![0.; tile_ctx * d]; // 暂存 k
+        let mut vj = vec![0.; tile_ctx * d]; // 暂存 v
+        let mut x = vec![0.; tile_ctx * tile_seq]; // 注意力分数
+        // block 之间完全无关，可以以任意方式并行
         FlashAttentionBlock {
             q: &q.as_deref().transform(|layout| layout.index(0, i)),
             k: &k.as_deref().transform(|layout| layout.index(0, i / g)),
@@ -63,6 +62,7 @@ pub fn flash_attention(
             kj: &mut kj,
             vj: &mut vj,
             x: &mut x,
+            n,
             d,
             b: tile_ctx,
             tr: n.div_ceil(tile_seq),
@@ -85,6 +85,7 @@ struct FlashAttentionBlock<'a> {
     vj: &'a mut [f64],
     x: &'a mut [f64],
 
+    n: usize,
     d: usize,
     b: usize,
     tr: usize,
@@ -96,15 +97,16 @@ impl FlashAttentionBlock<'_> {
     fn launch(self) {
         let Self {
             q,  // [n, d]
-            k,  // [n, d]
-            v,  // [n, d]
+            k,  // [s, d]
+            v,  // [s, d]
             o,  // [n, d]
-            l,  // [n]
-            m,  // [n]
+            l,  // [s]
+            m,  // [s]
             qi, // [b, d]
             kj, // [b, d]
             vj, // [b, d]
             x,  // [b, b]
+            n,
             d,
             b,
             tr,
@@ -131,6 +133,10 @@ impl FlashAttentionBlock<'_> {
                 let x = &mut x[tx * b..][..b];
 
                 for i in 0..tr {
+                    if i * b + tx >= n {
+                        break;
+                    }
+
                     let q = array::<f64>(q.as_deref().transform(|l| l.index(0, i * b + tx)));
                     let o =
                         array_mut::<f64>(o.as_deref_mut().transform(|l| l.index(0, i * b + tx)));
@@ -224,9 +230,9 @@ mod test {
     fn test_flash_attention() {
         const H: usize = 32;
         const KVH: usize = 4;
-        const N: usize = 512;
-        const S: usize = 512;
-        const D: usize = 256;
+        const N: usize = 7;
+        const S: usize = 2048;
+        const D: usize = 2048;
 
         let q = Tensor::from_dim_slice(types::F64, &[H, N, D]);
         let k = Tensor::from_dim_slice(types::F64, &[KVH, S, D]);
@@ -265,7 +271,9 @@ mod test {
     }
 
     fn random_data(n: usize) -> Vec<f64> {
-        (0..n).map(|i| (i as f64 * 0.1).sin() * 10.).collect()
+        (0..n)
+            .map(|_| (rand::random::<f64>() - 0.5) * 10.)
+            .collect()
     }
 
     fn erase_ty<T: Copy>(data: &[T]) -> &[u8] {

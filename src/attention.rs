@@ -14,6 +14,9 @@ pub fn flash_attention(
     k: Tensor<&[u8]>,
     v: Tensor<&[u8]>,
     mut o: Tensor<&mut [u8]>,
+    mut kc: Tensor<&mut [u8]>,
+    mut vc: Tensor<&mut [u8]>,
+    pos: usize,
     tile_seq: usize, // = tile q  = Br
     tile_ctx: usize, // = tile kv = Bc
 ) {
@@ -21,17 +24,22 @@ pub fn flash_attention(
     assert_eq!(k.dt(), types::F64);
     assert_eq!(v.dt(), types::F64);
     assert_eq!(o.dt(), types::F64);
+    assert_eq!(kc.dt(), types::F64);
+    assert_eq!(vc.dt(), types::F64);
 
     destruct!([h_q, n_q, d_q] = q.shape());
     destruct!([h_o, n_o, d_o] = o.shape());
-    destruct!([kvh_k, seq_k, d_k] = k.shape());
-    destruct!([kvh_v, seq_v, d_v] = v.shape());
+    destruct!([kvh_k, n_k, d_k] = k.shape());
+    destruct!([kvh_v, n_v, d_v] = v.shape());
+    destruct!([kvh_kc, buf_k, d_kc] = kc.shape());
+    destruct!([kvh_vc, buf_v, d_vc] = vc.shape());
 
     let h = distinct(&[h_q, h_o]).unwrap();
-    let kvh = distinct(&[kvh_k, kvh_v]).unwrap();
-    let n = distinct(&[n_q, n_o]).unwrap();
-    let s = distinct(&[seq_k, seq_v]).unwrap();
-    let d = distinct(&[d_q, d_k, d_v, d_o]).unwrap();
+    let kvh = distinct(&[kvh_k, kvh_v, kvh_kc, kvh_vc]).unwrap();
+    let n = distinct(&[n_q, n_k, n_v, n_o]).unwrap();
+    let s = pos + n;
+    let d = distinct(&[d_q, d_k, d_v, d_o, d_kc, d_vc]).unwrap();
+    assert!(buf_k >= s && buf_v >= s);
 
     assert_eq!(h % kvh, 0);
     let g = h / kvh;
@@ -51,6 +59,9 @@ pub fn flash_attention(
             .collect::<Vec<_>>()
     });
 
+    // 连接 kv cache
+    cache_concat(&k, &v, &mut kc, &mut vc, pos);
+    // 计算注意力
     for i in 0..h {
         // local
         let mut qi = vec![0.; tile_ctx * d]; // 暂存 q
@@ -60,8 +71,8 @@ pub fn flash_attention(
         // block 之间完全无关，可以以任意方式并行
         FlashAttentionBlock {
             q: &q.as_deref().transform(|l| l.index(0, i)),
-            k: &k.as_deref().transform(|l| l.index(0, i / g)),
-            v: &v.as_deref().transform(|l| l.index(0, i / g)),
+            k: &kc.as_deref().transform(|l| l.index(0, i / g)),
+            v: &vc.as_deref().transform(|l| l.index(0, i / g)),
             o: &mut o.as_deref_mut().transform(|l| l.index(0, i)),
             mask: &mask.as_deref(),
             l: &mut l[i * s..][..s],
@@ -78,6 +89,48 @@ pub fn flash_attention(
             scale,
         }
         .launch()
+    }
+}
+
+fn cache_concat(
+    k: &Tensor<&[u8]>,
+    v: &Tensor<&[u8]>,
+    kc: &mut Tensor<&mut [u8]>,
+    vc: &mut Tensor<&mut [u8]>,
+    pos: usize,
+) {
+    assert_eq!(k.dt(), types::F64);
+    assert_eq!(v.dt(), types::F64);
+    assert_eq!(kc.dt(), types::F64);
+    assert_eq!(vc.dt(), types::F64);
+
+    destruct!([kvh_k, n_k, d_k] = k.shape());
+    destruct!([kvh_v, n_v, d_v] = v.shape());
+    destruct!([kvh_kc, buf_k, d_kc] = kc.shape());
+    destruct!([kvh_vc, buf_v, d_vc] = vc.shape());
+
+    let kvh = distinct(&[kvh_k, kvh_v, kvh_kc, kvh_vc]).unwrap();
+    let n = distinct(&[n_k, n_v]).unwrap();
+    let s = pos + n;
+    let _ = distinct(&[d_k, d_v, d_kc, d_vc]).unwrap();
+    assert!(buf_k >= s && buf_v >= s);
+
+    // 连接 kv cache
+    // NOTICE GQA 需要发射 2 个，MHA 可以只发射 1 个
+    for i in 0..kvh {
+        let k = k.as_deref().transform(|l| l.index(0, i));
+        let v = v.as_deref().transform(|l| l.index(0, i));
+        let mut kc = kc.as_deref_mut().transform(|l| l.index(0, i));
+        let mut vc = vc.as_deref_mut().transform(|l| l.index(0, i));
+
+        for i in 0..n {
+            let k = array::<f64>(k.as_deref().transform(|l| l.index(0, i)));
+            let v = array::<f64>(v.as_deref().transform(|l| l.index(0, i)));
+            let kc = array_mut::<f64>(kc.as_deref_mut().transform(|l| l.index(0, pos + i)));
+            let vc = array_mut::<f64>(vc.as_deref_mut().transform(|l| l.index(0, pos + i)));
+            kc.copy_from_slice(k);
+            vc.copy_from_slice(v);
+        }
     }
 }
 
@@ -246,34 +299,58 @@ mod test {
         const H: usize = 32;
         const KVH: usize = 4;
         const N: usize = 7;
-        const S: usize = 2048;
+        const S: usize = 4096;
+        const P: usize = S - N;
         const D: usize = 2048;
 
         let q = Tensor::from_dim_slice(types::F64, [H, N, D]);
-        let k = Tensor::from_dim_slice(types::F64, [KVH, S, D]);
-        let v = Tensor::from_dim_slice(types::F64, [KVH, S, D]);
         let o = Tensor::from_dim_slice(types::F64, [H, N, D]);
+        let k = Tensor::from_dim_slice(types::F64, [KVH, N, D]);
+        let v = Tensor::from_dim_slice(types::F64, [KVH, N, D]);
+        let kc = Tensor::from_dim_slice(types::F64, [KVH, S, D]);
+        let vc = Tensor::from_dim_slice(types::F64, [KVH, S, D]);
 
         let q_data = random_data(H * N * D);
-        let k_data = random_data(KVH * S * D);
-        let v_data = random_data(KVH * S * D);
+        let k_data = random_data(KVH * N * D);
+        let v_data = random_data(KVH * N * D);
+        let kc_data = random_data(KVH * S * D);
+        let vc_data = random_data(KVH * S * D);
 
         let q = q.as_ref().map(|_| erase_ty(&q_data));
         let k = k.as_ref().map(|_| erase_ty(&k_data));
         let v = v.as_ref().map(|_| erase_ty(&v_data));
+        let kc = kc.as_ref().map(|_| erase_ty(&v_data));
+        let vc = vc.as_ref().map(|_| erase_ty(&v_data));
 
         // 计算标准 attention
         let mut ans = vec![0.0f64; H * N * D];
+        let mut kc_ans = kc_data.clone();
+        let mut vc_ans = vc_data.clone();
         attention(
             q.as_deref(),
             k.as_deref(),
             v.as_deref(),
-            o.as_ref().as_ref().map(|_| erase_ty_mut(&mut ans)),
+            o.as_ref().map(|_| erase_ty_mut(&mut ans)),
+            kc.as_ref().map(|_| erase_ty_mut(&mut kc_ans)),
+            vc.as_ref().map(|_| erase_ty_mut(&mut vc_ans)),
+            P,
         );
 
         // 计算 flash attention
         let mut res = vec![0.0f64; H * N * D];
-        flash_attention(q, k, v, o.as_ref().map(|_| erase_ty_mut(&mut res)), 32, 32);
+        let mut kc_res = kc_data;
+        let mut vc_res = vc_data;
+        flash_attention(
+            q,
+            k,
+            v,
+            o.as_ref().map(|_| erase_ty_mut(&mut res)),
+            kc.as_ref().map(|_| erase_ty_mut(&mut kc_res)),
+            vc.as_ref().map(|_| erase_ty_mut(&mut vc_res)),
+            P,
+            32,
+            32,
+        );
 
         for (ans, res) in zip(ans, res) {
             let e_abs = (ans - res).abs();
@@ -305,35 +382,45 @@ mod test {
         k: Tensor<&[u8]>,
         v: Tensor<&[u8]>,
         mut o: Tensor<&mut [u8]>,
+        mut kc: Tensor<&mut [u8]>,
+        mut vc: Tensor<&mut [u8]>,
+        pos: usize,
     ) {
         assert_eq!(q.dt(), types::F64);
         assert_eq!(k.dt(), types::F64);
         assert_eq!(v.dt(), types::F64);
         assert_eq!(o.dt(), types::F64);
+        assert_eq!(kc.dt(), types::F64);
+        assert_eq!(vc.dt(), types::F64);
 
         destruct!([h_q, n_q, d_q] = q.shape());
         destruct!([h_o, n_o, d_o] = o.shape());
-        destruct!([kvh_k, seq_k, d_k] = k.shape());
-        destruct!([kvh_v, seq_v, d_v] = v.shape());
+        destruct!([kvh_k, n_k, d_k] = k.shape());
+        destruct!([kvh_v, n_v, d_v] = v.shape());
+        destruct!([kvh_kc, buf_k, d_kc] = kc.shape());
+        destruct!([kvh_vc, buf_v, d_vc] = vc.shape());
 
         let h = distinct(&[h_q, h_o]).unwrap();
-        let kvh = distinct(&[kvh_k, kvh_v]).unwrap();
-        assert_eq!(h % kvh, 0);
-        let n = distinct(&[n_q, n_o]).unwrap();
-        let s = distinct(&[seq_k, seq_v]).unwrap();
-        let d = distinct(&[d_q, d_k, d_v, d_o]).unwrap();
+        let kvh = distinct(&[kvh_k, kvh_v, kvh_kc, kvh_vc]).unwrap();
+        let n = distinct(&[n_q, n_k, n_v, n_o]).unwrap();
+        let s = pos + n;
+        let d = distinct(&[d_q, d_k, d_v, d_o, d_kc, d_vc]).unwrap();
+        assert!(buf_k >= s && buf_v >= s);
 
+        assert_eq!(h % kvh, 0);
         let g = h / kvh;
         let scale = (d as f64).sqrt().recip();
+
+        // 连接 kv cache
+        cache_concat(&k, &v, &mut kc, &mut vc, pos);
+        // 计算注意力
         let mut score = vec![0.; s];
-        // 处理每个头
         for i in 0..h {
             let q = q.as_deref().transform(|l| l.index(0, i));
-            let k = k.as_deref().transform(|l| l.index(0, i / g));
-            let v = v.as_deref().transform(|l| l.index(0, i / g));
+            let k = kc.as_deref().transform(|l| l.index(0, i / g));
+            let v = vc.as_deref().transform(|l| l.index(0, i / g));
             let mut o = o.as_deref_mut().transform(|l| l.index(0, i));
 
-            // 处理每个 token
             for i in 0..n {
                 let q = array::<f64>(q.as_deref().transform(|l| l.index(0, i)));
                 let o = array_mut::<f64>(o.as_deref_mut().transform(|l| l.index(0, i)));

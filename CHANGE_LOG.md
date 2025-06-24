@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.6]
+
+### Changed
+
+- 根据 cuda flash attention 重构算法，用 CPU 模拟 GPU 并行；
+
 ## [0.0.5]
 
 ### Changed
@@ -46,7 +52,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - 创建项目；
 - 实现基本的 online softmax；
 
-[Unreleased]: https://github.com/YdrMaster/learn-flash-attn/compare/v0.0.5...HEAD
+[Unreleased]: https://github.com/YdrMaster/learn-flash-attn/compare/v0.0.6...HEAD
+[0.0.6]: https://github.com/YdrMaster/learn-flash-attn/compare/v0.0.5...v0.0.6
 [0.0.5]: https://github.com/YdrMaster/learn-flash-attn/compare/v0.0.4...v0.0.5
 [0.0.4]: https://github.com/YdrMaster/learn-flash-attn/compare/v0.0.3...v0.0.4
 [0.0.3]: https://github.com/YdrMaster/learn-flash-attn/compare/v0.0.2...v0.0.3

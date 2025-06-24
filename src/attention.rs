@@ -45,7 +45,7 @@ pub fn flash_attention(
     let mut m = vec![f64::NEG_INFINITY; h * s]; // 最大值缓存
 
     // causal mask
-    let mask = Tensor::from_dim_slice(types::Bool, &[n, s]).map(|len| {
+    let mask = Tensor::from_dim_slice(types::Bool, [n, s]).map(|len| {
         (0..len)
             .map(|i| if i % s <= s - n + i / s { 1u8 } else { 0u8 })
             .collect::<Vec<_>>()
@@ -203,7 +203,7 @@ impl FlashAttentionBlock<'_> {
 type Tensor<T> = any_tensor::Tensor<T, 3>;
 
 fn distinct<T: Eq + Copy>(val: &[T]) -> Option<T> {
-    let [ans, tail @ ..] = &*val else {
+    let [ans, tail @ ..] = val else {
         return None;
     };
     if tail.iter().all(|x| x == ans) {
@@ -252,10 +252,10 @@ mod test {
         const S: usize = 2048;
         const D: usize = 2048;
 
-        let q = Tensor::from_dim_slice(types::F64, &[H, N, D]);
-        let k = Tensor::from_dim_slice(types::F64, &[KVH, S, D]);
-        let v = Tensor::from_dim_slice(types::F64, &[KVH, S, D]);
-        let o = Tensor::from_dim_slice(types::F64, &[H, N, D]);
+        let q = Tensor::from_dim_slice(types::F64, [H, N, D]);
+        let k = Tensor::from_dim_slice(types::F64, [KVH, S, D]);
+        let v = Tensor::from_dim_slice(types::F64, [KVH, S, D]);
+        let o = Tensor::from_dim_slice(types::F64, [H, N, D]);
 
         let q_data = random_data(H * N * D);
         let k_data = random_data(KVH * S * D);
@@ -342,18 +342,18 @@ mod test {
                 let o = array_mut::<f64>(o.as_deref_mut().transform(|layout| layout.index(0, i)));
                 // score = q @ k^T / √d
                 let len = s - n + i + 1;
-                for i in 0..len {
+                for (i, score) in score.iter_mut().enumerate().take(len) {
                     let k = array::<f64>(k.as_deref().transform(|layout| layout.index(0, i)));
-                    score[i] = zip(q, k).map(|(q, k)| q * k).sum::<f64>() * scale
+                    *score = zip(q, k).map(|(q, k)| q * k).sum::<f64>() * scale
                 }
                 // causal softmax
                 safe_softmax(&mut score[..len]);
                 // o = a @ v // 乘法不连续
                 o.fill(0.);
-                for i in 0..len {
+                for (i, score) in score.iter().enumerate().take(len) {
                     let v = array::<f64>(v.as_deref().transform(|layout| layout.index(0, i)));
                     for (v, o) in zip(v, &mut *o) {
-                        *o += score[i] * v
+                        *o += score * v
                     }
                 }
             }

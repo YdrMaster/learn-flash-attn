@@ -217,11 +217,11 @@ impl FlashAttentionBlock<'_> {
             }
             // thread
             for it in 0..bn {
+                // 每个线程计算 q 的一行
                 let qi = &mut qi[it * d..][..d];
                 let x = &mut x[it * bs..][..bs];
 
                 for iqb in 0..n.div_ceil(bn) {
-                    // 每个线程计算 q 的一行
                     let iq = iqb * bn + it;
                     if iq >= n {
                         break;

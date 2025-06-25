@@ -9,90 +9,104 @@ macro_rules! destruct {
     };
 }
 
-pub fn flash_attention(
-    q: Tensor<&[u8]>,
-    k: Tensor<&[u8]>,
-    v: Tensor<&[u8]>,
-    mut o: Tensor<&mut [u8]>,
-    cache: Tensor<&mut [u8]>,
+pub struct Attention<'a> {
+    q: Tensor<&'a [u8]>,
+    k: Tensor<&'a [u8]>,
+    v: Tensor<&'a [u8]>,
+    o: Tensor<&'a mut [u8]>,
+    cache: Tensor<&'a mut [u8]>,
     pos: usize,
+}
+
+pub fn flash_attention(
+    reqs: &mut [Attention],
     tile_seq: usize, // = tile q  = bn
     tile_ctx: usize, // = tile kv = bs
 ) {
-    // 对齐数据类型
-    let dt = distinct(&[q.dt(), k.dt(), v.dt(), o.dt(), cache.dt()]).unwrap();
-    assert_eq!(dt, types::F64);
-    // 解构形状维度
-    destruct!([h_q, n_q, d_q] = q.shape());
-    destruct!([h_o, n_o, d_o] = o.shape());
-    destruct!([kvh_k, n_k, d_k] = k.shape());
-    destruct!([kvh_v, n_v, d_v] = v.shape());
-    destruct!([buf, 2, kvh_c, d_c] = cache.shape());
-    // 对齐张量形状
-    let h = distinct(&[h_q, h_o]).unwrap();
-    let kvh = distinct(&[kvh_k, kvh_v, kvh_c]).unwrap();
-    let n = distinct(&[n_q, n_k, n_v, n_o]).unwrap();
-    let s = pos + n;
-    let d = distinct(&[d_q, d_k, d_v, d_o, d_c]).unwrap();
-    assert!(buf >= s);
-    // 计算标量参数
-    assert_eq!(h % kvh, 0);
-    let g = h / kvh;
-    let scale = (d as f64).sqrt().recip();
-    // kv 以页为单位分配
-    assert_eq!(s % tile_ctx, 0);
-    let pages = (0..s / tile_ctx)
-        .map(|i| {
-            let t = cache.as_ref().transform(|l| l.index(0, i * tile_ctx));
-            unsafe { t.get().as_ptr().byte_offset(t.offset()).cast_mut().cast() }
-        })
-        .collect::<Box<_>>();
-    destruct!([sbuf, skv, sh, sd] = cache.strides());
-    assert_eq!(sd, dt.nbytes() as isize);
-    let pages = CachePages {
-        pages,
-        strides: [sbuf, skv, sh],
-        bs: tile_ctx,
-    };
-    // 生成 causal mask
-    let mask_data = (0..n * s)
-        .map(|i| i % s <= s - n + i / s)
-        .collect::<Vec<_>>();
-    let mask = Tensor::from_dim_slice(types::Bool, [n, s]).map(|_| erase_ty(&mask_data));
-    // global
-    let mut l = vec![0.; h * s]; // 注意力分母
-    let mut m = vec![f64::NEG_INFINITY; h * s]; // 最大值缓存
-    // 连接 kv cache
-    pages.concat(&k, &v, pos);
-    // 计算注意力
-    for head in 0..h {
-        // local
-        let mut qi = vec![0.; tile_seq * d]; // 暂存 q
-        let mut kj = vec![0.; tile_ctx * d]; // 暂存 k
-        let mut vj = vec![0.; tile_ctx * d]; // 暂存 v
-        let mut x = vec![0.; tile_ctx * tile_seq]; // 注意力分数
-        // block 之间完全无关，可以以任意方式并行
-        FlashAttentionBlock {
-            head: head / g,
-            pages: &pages,
-
-            q: &q.as_deref().transform(|l| l.index(0, head)),
-            o: &mut o.as_deref_mut().transform(|l| l.index(0, head)),
-            mask: &mask.as_deref(),
-            l: &mut l[head * s..][..s],
-            m: &mut m[head * s..][..s],
-            qi: &mut qi,
-            kj: &mut kj,
-            vj: &mut vj,
-            x: &mut x,
-            n,
-            s,
-            d,
-            bn: tile_seq,
+    for req in reqs {
+        let Attention {
+            q,
+            k,
+            v,
+            o,
+            cache,
+            pos,
+        } = req;
+        // 对齐数据类型
+        let dt = distinct(&[q.dt(), k.dt(), v.dt(), o.dt(), cache.dt()]).unwrap();
+        assert_eq!(dt, types::F64);
+        // 解构形状维度
+        destruct!([h_q, n_q, d_q] = q.shape());
+        destruct!([h_o, n_o, d_o] = o.shape());
+        destruct!([kvh_k, n_k, d_k] = k.shape());
+        destruct!([kvh_v, n_v, d_v] = v.shape());
+        destruct!([buf, 2, kvh_c, d_c] = cache.shape());
+        // 对齐张量形状
+        let h = distinct(&[h_q, h_o]).unwrap();
+        let kvh = distinct(&[kvh_k, kvh_v, kvh_c]).unwrap();
+        let n = distinct(&[n_q, n_k, n_v, n_o]).unwrap();
+        let s = *pos + n;
+        let d = distinct(&[d_q, d_k, d_v, d_o, d_c]).unwrap();
+        assert!(buf >= s);
+        // 计算标量参数
+        assert_eq!(h % kvh, 0);
+        let g = h / kvh;
+        let scale = (d as f64).sqrt().recip();
+        // kv 以页为单位分配
+        assert_eq!(s % tile_ctx, 0);
+        let pages = (0..s / tile_ctx)
+            .map(|i| {
+                let t = cache.as_ref().transform(|l| l.index(0, i * tile_ctx));
+                unsafe { t.get().as_ptr().byte_offset(t.offset()).cast_mut().cast() }
+            })
+            .collect::<Box<_>>();
+        destruct!([sbuf, skv, sh, sd] = cache.strides());
+        assert_eq!(sd, dt.nbytes() as isize);
+        let pages = CachePages {
+            pages,
+            strides: [sbuf, skv, sh],
             bs: tile_ctx,
-            scale,
+        };
+        // 生成 causal mask
+        let mask_data = (0..n * s)
+            .map(|i| i % s <= s - n + i / s)
+            .collect::<Vec<_>>();
+        let mask = Tensor::from_dim_slice(types::Bool, [n, s]).map(|_| erase_ty(&mask_data));
+        // global
+        let mut l = vec![0.; h * s]; // 注意力分母
+        let mut m = vec![f64::NEG_INFINITY; h * s]; // 最大值缓存
+        // 连接 kv cache
+        pages.concat(&k, &v, *pos);
+        // 计算注意力
+        for head in 0..h {
+            // local
+            let mut qi = vec![0.; tile_seq * d]; // 暂存 q
+            let mut kj = vec![0.; tile_ctx * d]; // 暂存 k
+            let mut vj = vec![0.; tile_ctx * d]; // 暂存 v
+            let mut x = vec![0.; tile_ctx * tile_seq]; // 注意力分数
+            // block 之间完全无关，可以以任意方式并行
+            FlashAttentionBlock {
+                head: head / g,
+                pages: &pages,
+
+                q: &q.as_deref().transform(|l| l.index(0, head)),
+                o: &mut o.as_deref_mut().transform(|l| l.index(0, head)),
+                mask: &mask.as_deref(),
+                l: &mut l[head * s..][..s],
+                m: &mut m[head * s..][..s],
+                qi: &mut qi,
+                kj: &mut kj,
+                vj: &mut vj,
+                x: &mut x,
+                n,
+                s,
+                d,
+                bn: tile_seq,
+                bs: tile_ctx,
+                scale,
+            }
+            .launch()
         }
-        .launch()
     }
 }
 
@@ -352,16 +366,15 @@ mod test {
         // 计算 flash attention
         let mut res = vec![0.0f64; H * N * D];
         let mut cache_res = cache_data;
-        flash_attention(
+        let mut reqs = [Attention {
             q,
             k,
             v,
-            o.as_ref().map(|_| erase_ty_mut(&mut res)),
-            cache.as_ref().map(|_| erase_ty_mut(&mut cache_res)),
-            P,
-            4,
-            32,
-        );
+            o: o.as_ref().map(|_| erase_ty_mut(&mut res)),
+            cache: cache.as_ref().map(|_| erase_ty_mut(&mut cache_res)),
+            pos: P,
+        }];
+        flash_attention(&mut reqs, 4, 32);
 
         for (ans, res) in zip(ans, res).chain(zip(cache_ans, cache_res)) {
             let e_abs = (ans - res).abs();

@@ -7,11 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.0.7] - 2025-06-24
+## [0.0.7] - 2025-06-25
 
 ### Added
 
 - 支持 kv cache；
+
+### Changed
+
+- 不再要求 q kv 分块等大；
 
 ## [0.0.6] - 2025-06-24
 

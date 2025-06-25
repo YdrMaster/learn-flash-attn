@@ -14,7 +14,7 @@ pub fn flash_attention(
     k: Tensor<&[u8]>,
     v: Tensor<&[u8]>,
     mut o: Tensor<&mut [u8]>,
-    mut cache: Tensor<&mut [u8]>,
+    cache: Tensor<&mut [u8]>,
     pos: usize,
     tile_seq: usize, // = tile q  = bn
     tile_ctx: usize, // = tile kv = bs
@@ -41,6 +41,14 @@ pub fn flash_attention(
     let scale = (d as f64).sqrt().recip();
     // kv 以页为单位分配
     assert_eq!(s % tile_ctx, 0);
+    let pages = (0..s / tile_ctx)
+        .map(|i| {
+            let t = cache.as_ref().transform(|l| l.index(0, i * tile_ctx));
+            unsafe { t.get().as_ptr().byte_offset(t.offset()).cast_mut() }
+        })
+        .collect::<Vec<_>>();
+    destruct!([sbuf, skv, sh, sd] = cache.strides());
+    assert_eq!(sd, dt.nbytes() as isize);
     // 生成 causal mask
     let mask_data = (0..n * s)
         .map(|i| i % s <= s - n + i / s)
@@ -50,7 +58,7 @@ pub fn flash_attention(
     let mut l = vec![0.; h * s]; // 注意力分母
     let mut m = vec![f64::NEG_INFINITY; h * s]; // 最大值缓存
     // 连接 kv cache
-    cache_concat(&k, &v, &mut cache, pos);
+    cache_concat_paged(&k, &v, &pages, &[sbuf, skv, sh], pos, tile_ctx);
     // 计算注意力
     let k = cache.as_deref().transform(|l| l.index(1, 0));
     let v = cache.as_deref().transform(|l| l.index(1, 1));
@@ -85,33 +93,39 @@ pub fn flash_attention(
 }
 
 /// NOTICE GQA 需要发射此 kernel，MHA 可以合并到计算
-fn cache_concat(k: &Tensor<&[u8]>, v: &Tensor<&[u8]>, cache: &mut Tensor<&mut [u8]>, pos: usize) {
-    debug_assert!(matches!(
-        distinct(&[k.dt(), v.dt(), cache.dt()]),
-        Some(types::F64)
-    ));
+fn cache_concat_paged(
+    k: &Tensor<&[u8]>,
+    v: &Tensor<&[u8]>,
+    pages: &[*mut u8], // [bs, k|v, kvh, d]
+    strides: &[isize], // [bs, k|v, kvh   ]
+    pos: usize,
+    bs: usize,
+) {
+    destruct!([kvh_k, n_k, _d] = k.shape());
+    destruct!([kvh_v, n_v, _d] = v.shape());
 
-    destruct!([kvh_k, n_k, d_k] = k.shape());
-    destruct!([kvh_v, n_v, d_v] = v.shape());
-    destruct!([buf, 2, kvh_c, d_c] = cache.shape());
+    destruct!([sbuf, skv, sh] = strides);
+    let offset_k = 0;
+    let offset_v = skv;
 
-    let kvh = distinct(&[kvh_k, kvh_v, kvh_c]).unwrap();
+    let kvh = distinct(&[kvh_k, kvh_v]).unwrap();
     let n = distinct(&[n_k, n_v]).unwrap();
-    let s = pos + n;
-    debug_assert!(distinct(&[d_k, d_v, d_c]).is_some());
-    debug_assert!(buf >= s);
-
     for i in 0..kvh {
+        let offset_h = i as isize * sh;
+
         let k = k.as_deref().transform(|l| l.index(0, i));
         let v = v.as_deref().transform(|l| l.index(0, i));
-        let mut cache = cache.as_deref_mut().transform(|l| l.index(2, i));
 
         for i in 0..n {
-            let mut cache = cache.as_deref_mut().transform(|l| l.index(0, pos + i));
+            let i_cache = pos + i;
+            let page_ptr = pages[i_cache / bs];
+            let offset_buf = (i_cache % bs) as isize * sbuf;
+            let k_cache = unsafe { page_ptr.byte_offset(offset_buf + offset_k + offset_h) };
+            let v_cache = unsafe { page_ptr.byte_offset(offset_buf + offset_v + offset_h) };
             let k = array::<f64>(k.as_deref().transform(|l| l.index(0, i)));
             let v = array::<f64>(v.as_deref().transform(|l| l.index(0, i)));
-            array_mut::<f64>(cache.as_deref_mut().transform(|l| l.index(0, 0))).copy_from_slice(k);
-            array_mut::<f64>(cache.as_deref_mut().transform(|l| l.index(0, 1))).copy_from_slice(v);
+            unsafe { std::ptr::copy_nonoverlapping(k.as_ptr(), k_cache.cast(), k.len()) };
+            unsafe { std::ptr::copy_nonoverlapping(v.as_ptr(), v_cache.cast(), v.len()) };
         }
     }
 }
@@ -366,6 +380,45 @@ mod test {
 
     fn erase_ty_mut<T: Copy>(data: &mut [T]) -> &mut [u8] {
         unsafe { std::slice::from_raw_parts_mut(data.as_mut_ptr().cast(), size_of_val(data)) }
+    }
+
+    /// 连接 cache
+    fn cache_concat(
+        k: &Tensor<&[u8]>,
+        v: &Tensor<&[u8]>,
+        cache: &mut Tensor<&mut [u8]>,
+        pos: usize,
+    ) {
+        debug_assert!(matches!(
+            distinct(&[k.dt(), v.dt(), cache.dt()]),
+            Some(types::F64)
+        ));
+
+        destruct!([kvh_k, n_k, d_k] = k.shape());
+        destruct!([kvh_v, n_v, d_v] = v.shape());
+        destruct!([buf, 2, kvh_c, d_c] = cache.shape());
+
+        let kvh = distinct(&[kvh_k, kvh_v, kvh_c]).unwrap();
+        let n = distinct(&[n_k, n_v]).unwrap();
+        let s = pos + n;
+        debug_assert!(distinct(&[d_k, d_v, d_c]).is_some());
+        debug_assert!(buf >= s);
+
+        for i in 0..kvh {
+            let k = k.as_deref().transform(|l| l.index(0, i));
+            let v = v.as_deref().transform(|l| l.index(0, i));
+            let mut cache = cache.as_deref_mut().transform(|l| l.index(2, i));
+
+            for i in 0..n {
+                let mut cache = cache.as_deref_mut().transform(|l| l.index(0, pos + i));
+                let k = array::<f64>(k.as_deref().transform(|l| l.index(0, i)));
+                let v = array::<f64>(v.as_deref().transform(|l| l.index(0, i)));
+                array_mut::<f64>(cache.as_deref_mut().transform(|l| l.index(0, 0)))
+                    .copy_from_slice(k);
+                array_mut::<f64>(cache.as_deref_mut().transform(|l| l.index(0, 1)))
+                    .copy_from_slice(v);
+            }
+        }
     }
 
     /// 多头注意力计算

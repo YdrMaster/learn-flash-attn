@@ -44,11 +44,16 @@ pub fn flash_attention(
     let pages = (0..s / tile_ctx)
         .map(|i| {
             let t = cache.as_ref().transform(|l| l.index(0, i * tile_ctx));
-            unsafe { t.get().as_ptr().byte_offset(t.offset()).cast_mut() }
+            unsafe { t.get().as_ptr().byte_offset(t.offset()).cast_mut().cast() }
         })
-        .collect::<Vec<_>>();
+        .collect::<Box<_>>();
     destruct!([sbuf, skv, sh, sd] = cache.strides());
     assert_eq!(sd, dt.nbytes() as isize);
+    let pages = CachePages {
+        pages,
+        strides: [sbuf, skv, sh],
+        bs: tile_ctx,
+    };
     // 生成 causal mask
     let mask_data = (0..n * s)
         .map(|i| i % s <= s - n + i / s)
@@ -58,7 +63,7 @@ pub fn flash_attention(
     let mut l = vec![0.; h * s]; // 注意力分母
     let mut m = vec![f64::NEG_INFINITY; h * s]; // 最大值缓存
     // 连接 kv cache
-    cache_concat_paged(&k, &v, &pages, &[sbuf, skv, sh], pos, tile_ctx);
+    pages.concat(&k, &v, pos);
     // 计算注意力
     let k = cache.as_deref().transform(|l| l.index(1, 0));
     let v = cache.as_deref().transform(|l| l.index(1, 1));
@@ -92,40 +97,42 @@ pub fn flash_attention(
     }
 }
 
-/// NOTICE GQA 需要发射此 kernel，MHA 可以合并到计算
-fn cache_concat_paged(
-    k: &Tensor<&[u8]>,
-    v: &Tensor<&[u8]>,
-    pages: &[*mut u8], // [bs, k|v, kvh, d]
-    strides: &[isize], // [bs, k|v, kvh   ]
-    pos: usize,
+struct CachePages {
+    pages: Box<[*mut f64]>,
+    strides: [isize; 3],
     bs: usize,
-) {
-    destruct!([kvh_k, n_k, _d] = k.shape());
-    destruct!([kvh_v, n_v, _d] = v.shape());
+}
 
-    destruct!([sbuf, skv, sh] = strides);
-    let offset_k = 0;
-    let offset_v = skv;
+impl CachePages {
+    /// NOTICE GQA 需要发射此 kernel，MHA 可以合并到计算
+    fn concat(&self, k: &Tensor<&[u8]>, v: &Tensor<&[u8]>, pos: usize) {
+        destruct!([kvh_k, n_k, _d] = k.shape());
+        destruct!([kvh_v, n_v, _d] = v.shape());
 
-    let kvh = distinct(&[kvh_k, kvh_v]).unwrap();
-    let n = distinct(&[n_k, n_v]).unwrap();
-    for i in 0..kvh {
-        let offset_h = i as isize * sh;
+        let CachePages { pages, strides, bs } = self;
+        let [sbuf, skv, sh] = *strides;
+        let sk = 0;
+        let sv = skv;
 
-        let k = k.as_deref().transform(|l| l.index(0, i));
-        let v = v.as_deref().transform(|l| l.index(0, i));
+        let kvh = distinct(&[kvh_k, kvh_v]).unwrap();
+        let n = distinct(&[n_k, n_v]).unwrap();
+        for i in 0..kvh {
+            let sh = i as isize * sh;
 
-        for i in 0..n {
-            let i_cache = pos + i;
-            let page_ptr = pages[i_cache / bs];
-            let offset_buf = (i_cache % bs) as isize * sbuf;
-            let k_cache = unsafe { page_ptr.byte_offset(offset_buf + offset_k + offset_h) };
-            let v_cache = unsafe { page_ptr.byte_offset(offset_buf + offset_v + offset_h) };
-            let k = array::<f64>(k.as_deref().transform(|l| l.index(0, i)));
-            let v = array::<f64>(v.as_deref().transform(|l| l.index(0, i)));
-            unsafe { std::ptr::copy_nonoverlapping(k.as_ptr(), k_cache.cast(), k.len()) };
-            unsafe { std::ptr::copy_nonoverlapping(v.as_ptr(), v_cache.cast(), v.len()) };
+            let k = k.as_deref().transform(|l| l.index(0, i));
+            let v = v.as_deref().transform(|l| l.index(0, i));
+
+            for i in 0..n {
+                let i_cache = pos + i;
+                let page_ptr = pages[i_cache / bs];
+                let sbuf = (i_cache % bs) as isize * sbuf;
+                let k_cache = unsafe { page_ptr.byte_offset(sbuf + sk + sh) };
+                let v_cache = unsafe { page_ptr.byte_offset(sbuf + sv + sh) };
+                let k = array::<f64>(k.as_deref().transform(|l| l.index(0, i)));
+                let v = array::<f64>(v.as_deref().transform(|l| l.index(0, i)));
+                unsafe { std::ptr::copy_nonoverlapping(k.as_ptr(), k_cache.cast(), k.len()) };
+                unsafe { std::ptr::copy_nonoverlapping(v.as_ptr(), v_cache.cast(), v.len()) };
+            }
         }
     }
 }

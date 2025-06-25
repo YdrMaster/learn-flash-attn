@@ -65,9 +65,7 @@ pub fn flash_attention(
     // 连接 kv cache
     pages.concat(&k, &v, pos);
     // 计算注意力
-    let k = cache.as_deref().transform(|l| l.index(1, 0));
-    let v = cache.as_deref().transform(|l| l.index(1, 1));
-    for i in 0..h {
+    for head in 0..h {
         // local
         let mut qi = vec![0.; tile_seq * d]; // 暂存 q
         let mut kj = vec![0.; tile_ctx * d]; // 暂存 k
@@ -75,13 +73,14 @@ pub fn flash_attention(
         let mut x = vec![0.; tile_ctx * tile_seq]; // 注意力分数
         // block 之间完全无关，可以以任意方式并行
         FlashAttentionBlock {
-            q: &q.as_deref().transform(|l| l.index(0, i)),
-            k: &k.as_deref().transform(|l| l.index(1, i / g)),
-            v: &v.as_deref().transform(|l| l.index(1, i / g)),
-            o: &mut o.as_deref_mut().transform(|l| l.index(0, i)),
+            head: head / g,
+            pages: &pages,
+
+            q: &q.as_deref().transform(|l| l.index(0, head)),
+            o: &mut o.as_deref_mut().transform(|l| l.index(0, head)),
             mask: &mask.as_deref(),
-            l: &mut l[i * s..][..s],
-            m: &mut m[i * s..][..s],
+            l: &mut l[head * s..][..s],
+            m: &mut m[head * s..][..s],
             qi: &mut qi,
             kj: &mut kj,
             vj: &mut vj,
@@ -109,25 +108,14 @@ impl CachePages {
         destruct!([kvh_k, n_k, _d] = k.shape());
         destruct!([kvh_v, n_v, _d] = v.shape());
 
-        let CachePages { pages, strides, bs } = self;
-        let [sbuf, skv, sh] = *strides;
-        let sk = 0;
-        let sv = skv;
-
         let kvh = distinct(&[kvh_k, kvh_v]).unwrap();
         let n = distinct(&[n_k, n_v]).unwrap();
-        for i in 0..kvh {
-            let sh = i as isize * sh;
-
-            let k = k.as_deref().transform(|l| l.index(0, i));
-            let v = v.as_deref().transform(|l| l.index(0, i));
+        for head in 0..kvh {
+            let k = k.as_deref().transform(|l| l.index(0, head));
+            let v = v.as_deref().transform(|l| l.index(0, head));
 
             for i in 0..n {
-                let i_cache = pos + i;
-                let page_ptr = pages[i_cache / bs];
-                let sbuf = (i_cache % bs) as isize * sbuf;
-                let k_cache = unsafe { page_ptr.byte_offset(sbuf + sk + sh) };
-                let v_cache = unsafe { page_ptr.byte_offset(sbuf + sv + sh) };
+                let [k_cache, v_cache] = self.at(head, pos + i);
                 let k = array::<f64>(k.as_deref().transform(|l| l.index(0, i)));
                 let v = array::<f64>(v.as_deref().transform(|l| l.index(0, i)));
                 unsafe { std::ptr::copy_nonoverlapping(k.as_ptr(), k_cache.cast(), k.len()) };
@@ -135,15 +123,22 @@ impl CachePages {
             }
         }
     }
+
+    fn at(&self, head: usize, pos: usize) -> [*mut f64; 2] {
+        let [sbuf, skv, sh] = self.strides;
+        let sh = head as isize * sh;
+        let sbuf = (pos % self.bs) as isize * sbuf;
+        let base = unsafe { self.pages[pos / self.bs].byte_offset(sh + sbuf) };
+        [base, unsafe { base.byte_offset(skv) }]
+    }
 }
 
 struct FlashAttentionBlock<'a> {
+    head: usize,
+    pages: &'a CachePages,
+
     /// shape = {n, d}
     q: &'a Tensor<&'a [u8]>,
-    /// shape = {s, d}
-    k: &'a Tensor<&'a [u8]>,
-    /// shape = {s, d}
-    v: &'a Tensor<&'a [u8]>,
     /// shape = {n, d}
     o: &'a mut Tensor<&'a mut [u8]>,
     /// shape = {n, s}
@@ -172,9 +167,9 @@ struct FlashAttentionBlock<'a> {
 impl FlashAttentionBlock<'_> {
     fn launch(self) {
         let Self {
+            head,
+            pages,
             q,
-            k,
-            v,
             o,
             mask,
             l,
@@ -198,12 +193,11 @@ impl FlashAttentionBlock<'_> {
                 let mut ikv = ikvb * bs + it;
                 let mut i = it;
                 while ikv < (ikvb + 1) * bs {
-                    let k = array::<f64>(k.as_deref().transform(|l| l.index(0, ikv)));
-                    let v = array::<f64>(v.as_deref().transform(|l| l.index(0, ikv)));
+                    let [k, v] = pages.at(head, ikv);
                     ikv += bn;
 
-                    kj[i * d..][..d].copy_from_slice(k);
-                    vj[i * d..][..d].copy_from_slice(v);
+                    unsafe { std::ptr::copy_nonoverlapping(k, kj[i * d..].as_mut_ptr(), d) };
+                    unsafe { std::ptr::copy_nonoverlapping(v, vj[i * d..].as_mut_ptr(), d) };
                     i += bn;
                 }
             }

@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.8] - 2025-06-25
+
+### Added
+
+- 支持 paged attention；
+
 ## [0.0.7] - 2025-06-25
 
 ### Added
@@ -62,7 +68,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - 创建项目；
 - 实现基本的 online softmax；
 
-[Unreleased]: https://github.com/YdrMaster/learn-flash-attn/compare/v0.0.7...HEAD
+[Unreleased]: https://github.com/YdrMaster/learn-flash-attn/compare/v0.0.8...HEAD
+[0.0.8]: https://github.com/YdrMaster/learn-flash-attn/compare/v0.0.7...v0.0.8
 [0.0.7]: https://github.com/YdrMaster/learn-flash-attn/compare/v0.0.6...v0.0.7
 [0.0.6]: https://github.com/YdrMaster/learn-flash-attn/compare/v0.0.5...v0.0.6
 [0.0.5]: https://github.com/YdrMaster/learn-flash-attn/compare/v0.0.4...v0.0.5

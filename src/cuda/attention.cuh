@@ -1,4 +1,3 @@
-﻿#include <cstdio>
 #include <cuda/std/cstdint>
 #include <math_constants.h>
 
@@ -26,7 +25,6 @@ __device__ kv_cache<T> locate_cache(
         (T *)(page + sh + sbuf + skv),
     };
 }
-
 template <typename T>
 __device__ void __attn(
     T *const *kv_pages,
@@ -39,6 +37,7 @@ __device__ void __attn(
     uint64_t const d,      // head dim
     uint64_t const ts,     // = s/bs
     uint64_t const bs,     // context tile
+    uint64_t const g,      // GQA
     int64_t const sq,      //        q stride
     int64_t const so,      //        o stride
     int64_t const kv_sbuf, // sequence stride
@@ -50,101 +49,98 @@ __device__ void __attn(
     uint64_t const bn = blockDim.x;
     uint64_t const it = threadIdx.x;
     uint64_t const tn = (n + bn - 1) / bn;
-
+    // 目前把所有维度当作连续的
     extern __shared__ T sram[];
-    int tile_size = bs * d;
-    T *qi = sram;
-    T *kj = &sram[tile_size];
-    T *vj = &sram[tile_size * 2];
-    T *x = new T[bs];
-    // kv
-    for (uint64_t ikvb = 0; ikvb < ts; ++ikvb) {
-        // 加载kv
-        { // 每个线程拷贝 k/v 的一行，拷贝整个 kv block 到 local memory
-            uint64_t const end = (ikvb + 1) * bs;
-            for (uint64_t ikv = ikvb * bs + it, i = it; ikv < end; ikv += bn, i += bn) {
-                kv_cache const cache = locate_cache(kv_pages, kv_sbuf, kv_skv, kv_sh, bs, head, ikv);
-                for (uint64_t j = 0; j < d; ++j) {
-                    kj[i * d + j] = cache.k[j];
-                    vj[i * d + j] = cache.v[j];
-                }
-            }
-            __syncthreads();
+    T *kj = sram;
+    T *vj = sram + bs * d;
+    const T *q = q_ + head * n * d;
+    T *_o = o_ + head * n * d;
+    for (uint64_t iqb = 0; iqb < tn; ++iqb) {
+        uint64_t iq = iqb * bn + it;
+        if (iq >= n) {
+            continue;
         }
-        { // 每个线程计算 q 的一行
 
-            for (uint64_t iqb = 0; iqb < tn; ++iqb) {
-                uint64_t iq = iqb * bn + it;
-                if (iq >= n) {
-                    break;
-                }
-                // locate data 加载q
-                T const *q = q_ + iq * sq;
-                T *o = o_ + iq * so;
-                bool const *mask = mask_ + iq * n + ikvb * bs;
-                // load data
-                for (uint64_t i = 0; i < d; ++i) {
-                    qi[i] = q[i];
-                }
+        T mi = m[iq];
+        T li = l[iq];
+        T *o = _o + iq * d;
 
-                T const mi_1 = m[iq];
-                T const di_1 = l[iq];
-
-                // score = q @ k^T / √d
-                T mi = mi_1;
-                for (uint64_t i = 0; i < bs; ++i) {
-                    if (!mask[i]) {
-                        x[i] = -CUDART_INF_F;
-                    } else {
-                        T const *k = kj + i * d;
-
-                        for (uint64_t j = 0; j < d; ++j) {
-                            x[i] += qi[j] * k[j];
-                        }
-                        x[i] *= scale;
-
-                        if (x[i] > mi) {
-                            mi = x[i];
-                        }
-                    }
-                }
-                // P = exp(S - row_m), row_l = rowsum(P)
-                T sum = 0;
-                for (uint64_t i = 0; i < d; ++i) {
-                    x[i] = ::exp(x[i] - mi);
-                    sum += x[i];
-                }
-
-                T exp = di_1 * ::exp(mi_1 - mi);
-                T di = exp + sum;
-                // 更新mi,di
-                m[iq] = mi;
-                l[iq] = di;
-
-                T rdi = 1 / di;
-                exp *= rdi;
-                for (uint64_t i = 0; i < bs; ++i) {
-                    x[i] *= rdi;
-                }
-                T *xv = new T[d];
-                for (uint64_t i = 0; i < d; ++i) {
-                    xv[i] = 0;
-                }
-                for (uint64_t i = 0; i < bs; ++i) {
-                    T xi = x[i];
-                    T *vji = &vj[i * d];
+        for (uint64_t ikvb = 0; ikvb < ts; ++ikvb) {
+            // Load kv block to shared memory
+            {
+                uint64_t const end = (ikvb + 1) * bs;
+                for (uint64_t ikv = ikvb * bs + it, i = it; ikv < end; ikv += bn, i += bn) {
+                    kv_cache<T> cache = locate_cache<T>(kv_pages, kv_sbuf, kv_skv, kv_sh, bs, head/g, ikv);
                     for (uint64_t j = 0; j < d; ++j) {
-                        xv[j] += xi * vji[j];
+                        kj[i * d + j] = cache.k[j];
+                        vj[i * d + j] = cache.v[j];
                     }
                 }
-                for (uint64_t j = 0; j < d; ++j) {
-                    o[j] = o[j] * exp + xv[j];
+                __syncthreads();
+            }
+
+            // Load q_i and mask
+            T* qi_val= new T[d];
+            bool const *mask = mask_ + iq * bs * ts + ikvb * bs;
+
+            for (uint64_t j = 0; j < d; ++j) {
+                qi_val[j] = q[iq * d + j];
+            }
+
+            // Compute scores
+             T* scores = new T[bs];
+            T mi_local = -CUDART_INF_F;
+            for (uint64_t i = 0; i < bs; ++i) {
+                if (!mask[i]) {
+                    scores[i] = -CUDART_INF_F;
+                } else {
+                    scores[i] = 0;
+                    for (uint64_t j = 0; j < d; ++j) {
+                        scores[i] += qi_val[j] * kj[i * d + j];
+                    }
+                    scores[i] *= scale;
+                    if (scores[i] > mi_local) {
+                        mi_local = scores[i];
+                    }
                 }
             }
-            __syncthreads();
+
+            T mi_new = max(mi, mi_local);
+            T sum = 0.0;
+
+            for (uint64_t i = 0; i < bs; ++i) {
+                if (mask[i]) {
+                    scores[i] = exp(scores[i] - mi_new);
+                    sum += scores[i];
+                } else {
+                    scores[i] = 0;
+                }
+            }
+
+            T exp_old = (mi == -CUDART_INF_F) ? 0.0 : exp(mi - mi_new);
+            T li_new = exp_old * li + sum;
+            T rdi = (li_new == 0) ? 0.0 : 1.0 / li_new;
+
+            // Update output
+            for (uint64_t j = 0; j < d; ++j) {
+                T v_acc = 0.0;
+                for (uint64_t i = 0; i < bs; ++i) {
+                    if (mask[i]) {
+                        v_acc += scores[i] * vj[i * d + j];
+                    }
+                }
+                o[j] = o[j] * exp_old * li * rdi + v_acc * rdi;
+            }
+
+            mi = mi_new;
+            li = li_new;
         }
+
+        m[iq] = mi;
+        l[iq] = li;
     }
 }
+
 extern "C" __global__ void __attn_f64(
     double *const *kv_pages,
     double const *q_,
@@ -156,53 +152,16 @@ extern "C" __global__ void __attn_f64(
     uint64_t const d,
     uint64_t const ts,
     uint64_t const bs,
+    uint64_t const g,
     int64_t const sq,
     int64_t const so,
     int64_t const kv_sbuf,
     int64_t const kv_skv,
     int64_t const kv_sh,
     float const scale) {
-    // 打印所有参数
-    if (threadIdx.x == 0 && blockIdx.x == 0) {
-        printf("kv_pages: %p\n", kv_pages);
-        for (uint64_t i = 0; i < ts; ++i) {
-            printf("  kv_pages[%lu]: %p\n", i, kv_pages[i]);
-            double *page = kv_pages[i];
-            for (uint64_t j = 0; j < bs * d * 2; ++j) {
-                printf("    kv_pages[%lu][%lu]=%f\n", i, j, page[j]);
-            }
-        }
-        printf("q_: %p\n", q_);
-        for (uint64_t i = 0; i < n * d; ++i) {
-            printf("  q_[%lu]=%f\n", i, q_[i]);
-        }
-        printf("o_: %p\n", o_);
-        for (uint64_t i = 0; i < n * d; ++i) {
-            printf("  o_[%lu]=%f\n", i, o_[i]);
-        }
-        printf("mask_: %p\n", (void *)mask_);
-        for (uint64_t i = 0; i < n * n; ++i) {
-            printf("  mask_[%lu] = %s\n", i, mask_[i] ? "true" : "false");
-        }
-        printf("m: %p\n", m);
-        for (uint64_t i = 0; i < n; ++i) {
-            printf("  m[%lu]=%f\n", i, m[i]);
-        }
-        printf("l: %p\n", l);
-        for (uint64_t i = 0; i < n; ++i) {
-            printf("  l[%lu]=%f\n", i, l[i]);
-        }
-        printf("n: %lu\n", n);
-        printf("d: %lu\n", d);
-        printf("ts: %lu\n", ts);
-        printf("bs: %lu\n", bs);
-        printf("sq: %ld\n", sq);
-        printf("so: %ld\n", so);
-        printf("kv_sbuf: %ld\n", kv_sbuf);
-        printf("kv_skv: %ld\n", kv_skv);
-        printf("kv_sh: %ld\n", kv_sh);
-        printf("scale: %f\n", scale);
-    }
-    // 调用模板实现
-    __attn<double>(kv_pages, q_, o_, mask_, m, l, n, d, ts, bs, sq, so, kv_sbuf, kv_skv, kv_sh, scale);
+    __attn<double>(
+        kv_pages, q_, o_, mask_, m, l,
+        n, d, ts, bs,g, sq, so,
+        kv_sbuf, kv_skv, kv_sh, scale
+    );
 }

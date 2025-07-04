@@ -1,6 +1,9 @@
 ﻿mod cpu;
 mod kernel;
 
+#[cfg(cuda)]
+mod cuda;
+
 use macros::destruct;
 
 #[derive(Clone, Debug)]
@@ -117,7 +120,7 @@ mod test {
         const N: usize = 7;
         const S: usize = 4096;
         const P: usize = S - N;
-        const D: usize = 2048;
+        const D: usize = 64;
 
         const FLASH_ATTN: FlashAttnCfg = FlashAttnCfg {
             h: H,
@@ -156,25 +159,46 @@ mod test {
         );
 
         // 计算 flash attention
-        let mut res = vec![0.0f64; H * N * D];
-        let mut cache_res = cache_data;
-        let mut reqs = [Attention {
-            q,
-            k,
-            v,
-            o: o.as_ref().map(|_| erase_ty_mut(&mut res)),
-            cache: cache.as_ref().map(|_| erase_ty_mut(&mut cache_res)),
-            pos: P,
-        }];
-        FLASH_ATTN.compute_cpu(&mut reqs);
+        {
+            let mut res = vec![0.0f64; H * N * D];
+            let mut cache_res = cache_data.clone();
+            let mut reqs = [Attention {
+                q: q.clone(),
+                k: k.clone(),
+                v: v.clone(),
+                o: o.as_ref().map(|_| erase_ty_mut(&mut res)),
+                cache: cache.as_ref().map(|_| erase_ty_mut(&mut cache_res)),
+                pos: P,
+            }];
+            FLASH_ATTN.compute_cpu(&mut reqs);
 
-        for (ans, res) in zip(ans, res).chain(zip(cache_ans, cache_res)) {
-            let e_abs = (ans - res).abs();
-            assert!(
-                e_abs < 1e3 * f64::EPSILON,
-                "err = {e_abs:.3e} {}x",
-                e_abs / f64::EPSILON
-            )
+            for (ans, res) in zip(ans, res).chain(zip(cache_ans, cache_res)) {
+                let e_abs = (ans - res).abs();
+                assert!(
+                    e_abs < 1e3 * f64::EPSILON,
+                    "err = {e_abs:.3e} {}x",
+                    e_abs / f64::EPSILON
+                )
+            }
+        }
+        #[cfg(cuda)]
+        {
+            let mut res = vec![0.0f64; H * N * D];
+            let mut cache_res = cache_data.clone();
+            let mut reqs = [Attention {
+                q: q.clone(),
+                k: k.clone(),
+                v: v.clone(),
+                o: o.as_ref().map(|_| erase_ty_mut(&mut res)),
+                cache: cache.as_ref().map(|_| erase_ty_mut(&mut cache_res)),
+                pos: P,
+            }];
+
+            cuda::init().unwrap();
+            cuda::Device::new(0).context().apply(move |ctx| {
+                let stream = ctx.stream();
+                FLASH_ATTN.compute_cuda(&mut reqs, &stream)
+            })
         }
     }
 

@@ -51,6 +51,7 @@ impl FlashAttnCfg {
                 })
             })
             .collect::<Vec<_>>();
+        // 生成 workspace
         let req_memory = reqs
             .iter()
             .map(|req| {

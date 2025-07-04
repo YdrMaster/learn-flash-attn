@@ -1,6 +1,4 @@
-﻿use crate::FlashAttnCfg;
-
-type Tdata = f64;
+﻿type Tdata = f64;
 
 #[derive(Clone, Copy, Debug)]
 #[repr(C)]
@@ -49,7 +47,7 @@ pub(super) struct KernelReq {
     pub s: usize,
 }
 
-impl FlashAttnCfg {
+impl super::FlashAttnCfg {
     pub(super) fn to_kernel_cfg(&self) -> KernelCfg {
         let &Self {
             h,

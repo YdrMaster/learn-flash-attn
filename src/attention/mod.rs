@@ -1,4 +1,6 @@
 ﻿mod cpu;
+#[cfg(cuda)]
+mod cuda;
 
 use macros::destruct;
 

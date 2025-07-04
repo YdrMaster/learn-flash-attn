@@ -1,96 +1,113 @@
-﻿use super::{Attention, Tensor, array, array_mut, destruct, distinct, erase_ty};
+﻿use super::{Attention, Tensor, array, destruct, distinct, erase_ty};
+use crate::attention::FlashAttnCfg;
 use any_tensor::digit_layout::types;
-use std::iter::zip;
+use std::{iter::zip, rc::Rc};
 
-pub fn flash_attention(
-    reqs: &mut [Attention],
-    tile_seq: usize, // = tile q  = bn
-    tile_ctx: usize, // = tile kv = bs
-) {
-    for req in reqs {
-        let Attention {
-            q,
-            k,
-            v,
-            o,
-            cache,
-            pos,
-        } = req;
-        // 对齐数据类型
-        let dt = distinct(&[q.dt(), k.dt(), v.dt(), o.dt(), cache.dt()]).unwrap();
-        assert_eq!(dt, types::F64);
-        // 解构形状维度
-        destruct!([h_q, n_q, d_q] = q.shape());
-        destruct!([h_o, n_o, d_o] = o.shape());
-        destruct!([kvh_k, n_k, d_k] = k.shape());
-        destruct!([kvh_v, n_v, d_v] = v.shape());
-        destruct!([buf, 2, kvh_c, d_c] = cache.shape());
-        // 对齐张量形状
-        let h = distinct(&[h_q, h_o]).unwrap();
-        let kvh = distinct(&[kvh_k, kvh_v, kvh_c]).unwrap();
-        let n = distinct(&[n_q, n_k, n_v, n_o]).unwrap();
-        let s = *pos + n;
-        let d = distinct(&[d_q, d_k, d_v, d_o, d_c]).unwrap();
-        assert!(buf >= s);
-        // 计算标量参数
-        assert_eq!(h % kvh, 0);
-        let g = h / kvh;
-        let scale = (d as f64).sqrt().recip();
-        // kv 以页为单位分配
-        destruct!([sbuf, skv, sh, sd] = cache.strides());
-        assert_eq!(sd, dt.nbytes() as isize);
-        assert_eq!(s % tile_ctx, 0);
-        let pages = (0..s / tile_ctx)
-            .map(|i| {
-                let t = cache.as_ref().transform(|l| l.index(0, i * tile_ctx));
-                unsafe { t.get().as_ptr().byte_offset(t.offset()).cast_mut().cast() }
-            })
-            .collect::<Box<_>>();
-        let pages = CachePages {
-            pages,
-            strides: [sbuf, skv, sh],
-            bs: tile_ctx,
-            dh: d,
-        };
-        // 生成 causal mask
-        let mask_data = (0..n * s)
-            .map(|i| i % s <= s - n + i / s)
-            .collect::<Vec<_>>();
-        let mask = Tensor::from_dim_slice(types::Bool, [n, s]).map(|_| erase_ty(&mask_data));
-        // global
-        let mut l = vec![0.; h * s]; // 注意力分母
-        let mut m = vec![f64::NEG_INFINITY; h * s]; // 最大值缓存
-        // 连接 kv cache
-        pages.concat(&k, &v, *pos);
-        // 计算注意力
-        for head in 0..h {
-            // local
-            let mut qi = vec![0.; tile_seq * d]; // 暂存 q
-            let mut kj = vec![0.; tile_ctx * d]; // 暂存 k
-            let mut vj = vec![0.; tile_ctx * d]; // 暂存 v
-            let mut x = vec![0.; tile_ctx * tile_seq]; // 注意力分数
-            // block 之间完全无关，可以以任意方式并行
-            FlashAttentionBlock {
-                head: head / g,
-                pages: &pages,
+impl FlashAttnCfg {
+    pub fn compute_cpu(&self, reqs: &mut [Attention]) {
+        let &Self {
+            h,
+            kvh,
+            d,
+            tile_seq,
+            tile_ctx,
+        } = self;
 
-                q: &q.as_deref().transform(|l| l.index(0, head)),
-                o: &mut o.as_deref_mut().transform(|l| l.index(0, head)),
-                mask: &mask.as_deref(),
-                l: &mut l[head * s..][..s],
-                m: &mut m[head * s..][..s],
-                qi: &mut qi,
-                kj: &mut kj,
-                vj: &mut vj,
-                x: &mut x,
-                n,
-                s,
-                d,
-                bn: tile_seq,
+        let mut blocks = Vec::new();
+
+        for req in reqs {
+            let Attention {
+                q,
+                k,
+                v,
+                o,
+                cache,
+                pos,
+            } = req;
+            // 对齐数据类型
+            let dt = distinct(&[q.dt(), k.dt(), v.dt(), o.dt(), cache.dt()]).unwrap();
+            assert_eq!(dt, types::F64);
+            // 解构形状维度
+            destruct!([h_q, n_q, d_q] = q.shape());
+            destruct!([h_o, n_o, d_o] = o.shape());
+            destruct!([kvh_k, n_k, d_k] = k.shape());
+            destruct!([kvh_v, n_v, d_v] = v.shape());
+            destruct!([buf, 2, kvh_c, d_c] = cache.shape());
+            // 对齐张量形状
+            distinct(&[h, h_q, h_o]).unwrap();
+            distinct(&[kvh, kvh_k, kvh_v, kvh_c]).unwrap();
+            distinct(&[d, d_q, d_k, d_v, d_o, d_c]).unwrap();
+            let n = distinct(&[n_q, n_k, n_v, n_o]).unwrap();
+            let s = *pos + n;
+            assert!(buf >= s);
+            // 计算标量参数
+            assert_eq!(h % kvh, 0);
+            let g = h / kvh;
+            let scale = (d as f64).sqrt().recip();
+            // kv 以页为单位分配
+            destruct!([sbuf, skv, sh, sd] = cache.strides());
+            assert_eq!(sd, dt.nbytes() as isize);
+            assert_eq!(s % tile_ctx, 0);
+            let pages = (0..s / tile_ctx)
+                .map(|i| {
+                    let t = cache.as_ref().transform(|l| l.index(0, i * tile_ctx));
+                    unsafe { t.get().as_ptr().byte_offset(t.offset()).cast_mut().cast() }
+                })
+                .collect::<Box<_>>();
+            let pages = CachePages {
+                pages,
+                strides: [sbuf, skv, sh],
                 bs: tile_ctx,
-                scale,
+                dh: d,
+            };
+            // 生成 causal mask
+            let mask_data = (0..n * s)
+                .map(|i| i % s <= s - n + i / s)
+                .collect::<Rc<_>>();
+            let mask = Tensor::from_dim_slice(types::Bool, [n, s]).map(|_| erase_ty(&mask_data));
+            // 连接 kv cache
+            pages.concat(&k, &v, *pos);
+            let pages = Rc::new(pages);
+            // 计算注意力
+            for head in 0..h {
+                // global
+                let q = q.as_deref().transform(|l| l.index(0, head));
+                let mut o = o.as_deref_mut().transform(|l| l.index(0, head));
+                let l = vec![0.; s]; // 注意力分母
+                let m = vec![f64::NEG_INFINITY; s]; // 最大值缓存
+                // local
+                let qi = vec![0.; tile_seq * d]; // 暂存 q
+                let kj = vec![0.; tile_ctx * d]; // 暂存 k
+                let vj = vec![0.; tile_ctx * d]; // 暂存 v
+                let x = vec![0.; tile_ctx * tile_seq]; // 注意力分数
+                // block 之间完全无关，可以以任意方式并行
+                let blk = FlashAttentionBlock {
+                    head: head / g,
+                    pages: pages.clone(),
+
+                    q: Matrix::<*const f64>::from_tensor(&q),
+                    o: Matrix::<*mut f64>::from_tensor(&mut o),
+                    mask: Matrix::<*const bool>::from_tensor(&mask),
+                    l,
+                    m,
+                    qi,
+                    kj,
+                    vj,
+                    x,
+                    n,
+                    s,
+                    d,
+                    bn: tile_seq,
+                    bs: tile_ctx,
+                    scale,
+                };
+                blocks.push((mask_data.clone(), blk))
             }
-            .launch()
+        }
+
+        blocks.reverse(); // 验证执行顺序是无关的
+        for block in blocks {
+            block.1.launch()
         }
     }
 }
@@ -134,28 +151,27 @@ impl CachePages {
     }
 }
 
-struct FlashAttentionBlock<'a> {
+struct FlashAttentionBlock {
     head: usize,
-    pages: &'a CachePages,
+    pages: Rc<CachePages>,
 
+    q: Matrix<*const f64>,
     /// shape = {n, d}
-    q: &'a Tensor<&'a [u8]>,
-    /// shape = {n, d}
-    o: &'a mut Tensor<&'a mut [u8]>,
+    o: Matrix<*mut f64>,
     /// shape = {n, s}
-    mask: &'a Tensor<&'a [u8]>,
+    mask: Matrix<*const bool>,
     /// shape = {s}
-    l: &'a mut [f64],
+    l: Vec<f64>,
     /// shape = {s}
-    m: &'a mut [f64],
+    m: Vec<f64>,
     /// shape = {bn, d}
-    qi: &'a mut [f64],
+    qi: Vec<f64>,
     /// shape = {bs, d}
-    kj: &'a mut [f64],
+    kj: Vec<f64>,
     /// shape = {bs, d}
-    vj: &'a mut [f64],
+    vj: Vec<f64>,
     /// shape = {bn, bs}
-    x: &'a mut [f64],
+    x: Vec<f64>,
 
     n: usize,
     s: usize,
@@ -165,7 +181,42 @@ struct FlashAttentionBlock<'a> {
     scale: f64,
 }
 
-impl FlashAttentionBlock<'_> {
+struct Matrix<T> {
+    ptr: T,
+    ld: isize,
+}
+
+impl<T> Matrix<*const T> {
+    fn from_tensor(t: &Tensor<&[u8]>) -> Self {
+        destruct!([m, n] = t.strides());
+        assert_eq!(n, t.dt().nbytes() as isize);
+        Self {
+            ptr: unsafe { t.get().as_ptr().byte_offset(t.offset()).cast() },
+            ld: m / n,
+        }
+    }
+
+    fn row(&self, i: usize, d: usize) -> &[T] {
+        unsafe { std::slice::from_raw_parts(self.ptr.offset(i as isize * self.ld), d) }
+    }
+}
+
+impl<T> Matrix<*mut T> {
+    fn from_tensor(t: &mut Tensor<&mut [u8]>) -> Self {
+        destruct!([m, n] = t.strides());
+        assert_eq!(n, t.dt().nbytes() as isize);
+        Self {
+            ptr: unsafe { t.get_mut().as_mut_ptr().byte_offset(t.offset()).cast() },
+            ld: m / n,
+        }
+    }
+
+    fn row(&self, i: usize, d: usize) -> &mut [T] {
+        unsafe { std::slice::from_raw_parts_mut(self.ptr.offset(i as isize * self.ld), d) }
+    }
+}
+
+impl FlashAttentionBlock {
     fn launch(self) {
         let Self {
             head,
@@ -173,12 +224,12 @@ impl FlashAttentionBlock<'_> {
             q,
             o,
             mask,
-            l,
-            m,
-            qi,
-            kj,
-            vj,
-            x,
+            mut l,
+            mut m,
+            mut qi,
+            mut kj,
+            mut vj,
+            mut x,
             n,
             s,
             d,
@@ -214,9 +265,9 @@ impl FlashAttentionBlock<'_> {
                         break;
                     }
                     // locate data
-                    let q = array::<f64>(q.as_deref().transform(|l| l.index(0, iq)));
-                    let o = array_mut::<f64>(o.as_deref_mut().transform(|l| l.index(0, iq)));
-                    let mask = array::<bool>(mask.as_deref().transform(|l| l.index(0, iq)));
+                    let q = q.row(iq, d);
+                    let o = o.row(iq, d);
+                    let mask = mask.row(iq, s);
                     // load data
                     qi.copy_from_slice(q);
                     let mask = &mask[ikvb * bs..][..bs];

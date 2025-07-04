@@ -2,7 +2,14 @@
 
 use macros::destruct;
 
-pub use cpu::flash_attention;
+#[derive(Clone, Debug)]
+pub struct FlashAttnCfg {
+    pub h: usize,
+    pub kvh: usize,
+    pub d: usize,
+    pub tile_seq: usize,
+    pub tile_ctx: usize,
+}
 
 pub struct Attention<'a> {
     q: Tensor<&'a [u8]>,
@@ -39,19 +46,6 @@ fn array<T: Copy>(tensor: Tensor<&[u8]>) -> &[T] {
     data
 }
 
-fn array_mut<T: Copy>(tensor: Tensor<&mut [u8]>) -> &mut [T] {
-    destruct!([n] = tensor.shape());
-    destruct!([s] = tensor.strides());
-    assert_eq!(tensor.dt().nbytes(), s as usize);
-
-    let offset = tensor.offset() as usize;
-    let data = &mut tensor.take()[offset..][..n * s as usize];
-    let ([], data, []) = (unsafe { data.align_to_mut::<T>() }) else {
-        unreachable!()
-    };
-    data
-}
-
 fn erase_ty<T: Copy>(data: &[T]) -> &[u8] {
     unsafe { std::slice::from_raw_parts(data.as_ptr().cast(), size_of_val(data)) }
 }
@@ -69,10 +63,8 @@ mod macros {
 
 #[cfg(test)]
 mod test {
-    use super::{
-        Attention, Tensor, array, array_mut, destruct, distinct, erase_ty, flash_attention,
-    };
-    use crate::softmax::test::safe_softmax;
+    use super::{Attention, Tensor, array, destruct, distinct, erase_ty};
+    use crate::{FlashAttnCfg, softmax::test::safe_softmax};
     use any_tensor::digit_layout::types;
     use std::iter::zip;
 
@@ -84,6 +76,14 @@ mod test {
         const S: usize = 4096;
         const P: usize = S - N;
         const D: usize = 2048;
+
+        const FLASH_ATTN: FlashAttnCfg = FlashAttnCfg {
+            h: H,
+            kvh: KVH,
+            d: D,
+            tile_seq: 4,
+            tile_ctx: 32,
+        };
 
         let q = Tensor::from_dim_slice(types::F64, [H, N, D]);
         let o = Tensor::from_dim_slice(types::F64, [H, N, D]);
@@ -124,7 +124,7 @@ mod test {
             cache: cache.as_ref().map(|_| erase_ty_mut(&mut cache_res)),
             pos: P,
         }];
-        flash_attention(&mut reqs, 4, 32);
+        FLASH_ATTN.compute_cpu(&mut reqs);
 
         for (ans, res) in zip(ans, res).chain(zip(cache_ans, cache_res)) {
             let e_abs = (ans - res).abs();
@@ -247,5 +247,18 @@ mod test {
                 }
             }
         }
+    }
+
+    fn array_mut<T: Copy>(tensor: Tensor<&mut [u8]>) -> &mut [T] {
+        destruct!([n] = tensor.shape());
+        destruct!([s] = tensor.strides());
+        assert_eq!(tensor.dt().nbytes(), s as usize);
+
+        let offset = tensor.offset() as usize;
+        let data = &mut tensor.take()[offset..][..n * s as usize];
+        let ([], data, []) = (unsafe { data.align_to_mut::<T>() }) else {
+            unreachable!()
+        };
+        data
     }
 }

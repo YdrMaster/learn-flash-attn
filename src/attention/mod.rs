@@ -1,4 +1,4 @@
-﻿mod cpu;
+mod cpu;
 #[cfg(cuda)]
 mod cuda;
 
@@ -262,5 +262,74 @@ mod test {
             unreachable!()
         };
         data
+    }
+    #[test]
+    fn test_flash_attention_cuda() {
+        // 先计算不带cache的
+        const H: usize = 8;
+        const KVH: usize = 2;
+        const N: usize = 16;
+        const S: usize = 32;
+        const P: usize = S - N;
+        const D: usize = 256;
+
+
+        const FLASH_ATTN: FlashAttnCfg = FlashAttnCfg {
+            h: H,
+            kvh: KVH,
+            d: D,
+            tile_seq: 4,
+            tile_ctx: 4,
+        };
+
+        let q = Tensor::from_dim_slice(types::F64, [H, N, D]);
+        let o = Tensor::from_dim_slice(types::F64, [H, N, D]);
+        let k = Tensor::from_dim_slice(types::F64, [KVH, N, D]);
+        let v = Tensor::from_dim_slice(types::F64, [KVH, N, D]);
+        let cache = Tensor::from_dim_slice(types::F64, [S, 2, KVH, D]);
+
+        let q_data = random_data(H * N * D);
+        let k_data = random_data(KVH * N * D);
+        let v_data = random_data(KVH * N * D);
+        let cache_data = random_data(S * 2 * KVH * D);
+
+        let q = q.as_ref().map(|_| erase_ty(&q_data));
+        let k = k.as_ref().map(|_| erase_ty(&k_data));
+        let v = v.as_ref().map(|_| erase_ty(&v_data));
+        let cache = cache.as_ref().map(|_| erase_ty(&v_data));
+
+        // 计算标准 attention
+        let mut ans = vec![0.0f64; H * N * D];
+        let mut cache_ans = cache_data.clone();
+        attention(
+            q.as_deref(),
+            k.as_deref(),
+            v.as_deref(),
+            o.as_ref().map(|_| erase_ty_mut(&mut ans)),
+            cache.as_ref().map(|_| erase_ty_mut(&mut cache_ans)),
+            P,
+        );
+
+        // 计算 flash attention
+        let mut res = vec![0.0f64; H * N * D];
+        let mut cache_res = cache_data;
+        let mut reqs = [Attention {
+            q,
+            k,
+            v,
+            o: o.as_ref().map(|_| erase_ty_mut(&mut res)),
+            cache: cache.as_ref().map(|_| erase_ty_mut(&mut cache_res)),
+            pos: P,
+        }];
+        FLASH_ATTN.compute_cuda(&mut reqs);
+        println!("{:?}", res);
+        for (ans, res) in zip(ans, res).chain(zip(cache_ans, cache_res)) {
+            let e_abs = (ans - res).abs();
+            assert!(
+                e_abs < 1e-5,
+                "err = {e_abs:.3e} {}x",
+                e_abs / f64::EPSILON
+            )
+        }
     }
 }

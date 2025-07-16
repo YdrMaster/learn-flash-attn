@@ -1,315 +1,214 @@
-﻿use super::{Attention, Tensor, array, destruct, distinct, erase_ty};
-use crate::attention::FlashAttnCfg;
-use any_tensor::digit_layout::types;
-use std::{iter::zip, rc::Rc};
+﻿use super::{Attention, destruct};
+use crate::attention::{
+    FlashAttnCfg, cache_concat,
+    kernel::{KVPage, KernelCfg, KernelReq, Strides2D},
+};
+use rand::seq::SliceRandom;
+use std::{
+    iter::zip,
+    ptr::copy_nonoverlapping,
+    slice::{from_raw_parts, from_raw_parts_mut},
+};
 
 impl FlashAttnCfg {
     pub fn compute_cpu(&self, reqs: &mut [Attention]) {
+        // 连接 kv cache
+        for req in &mut *reqs {
+            cache_concat(&req.k, &req.v, &mut req.cache, req.pos)
+        }
         let &Self {
             h,
-            kvh,
-            d,
             tile_seq,
             tile_ctx,
+            ..
         } = self;
-
-        let mut blocks = Vec::new();
-
-        for req in reqs {
-            let Attention {
-                q,
-                k,
-                v,
-                o,
-                cache,
-                pos,
-            } = req;
-            // 对齐数据类型
-            let dt = distinct(&[q.dt(), k.dt(), v.dt(), o.dt(), cache.dt()]).unwrap();
-            assert_eq!(dt, types::F64);
-            // 解构形状维度
-            destruct!([h_q, n_q, d_q] = q.shape());
-            destruct!([h_o, n_o, d_o] = o.shape());
-            destruct!([kvh_k, n_k, d_k] = k.shape());
-            destruct!([kvh_v, n_v, d_v] = v.shape());
-            destruct!([buf, 2, kvh_c, d_c] = cache.shape());
-            // 对齐张量形状
-            distinct(&[h, h_q, h_o]).unwrap();
-            distinct(&[kvh, kvh_k, kvh_v, kvh_c]).unwrap();
-            distinct(&[d, d_q, d_k, d_v, d_o, d_c]).unwrap();
-            let n = distinct(&[n_q, n_k, n_v, n_o]).unwrap();
-            let s = *pos + n;
-            assert!(buf >= s);
-            // 计算标量参数
-            assert_eq!(h % kvh, 0);
-            let g = h / kvh;
-            let scale = (d as f64).sqrt().recip();
-            // kv 以页为单位分配
-            destruct!([sbuf, skv, sh, sd] = cache.strides());
-            assert_eq!(sd, dt.nbytes() as isize);
-            assert_eq!(s % tile_ctx, 0);
-            let pages = (0..s / tile_ctx)
-                .map(|i| {
-                    let t = cache.as_ref().transform(|l| l.index(0, i * tile_ctx));
-                    unsafe { t.get().as_ptr().byte_offset(t.offset()).cast_mut().cast() }
+        // 生成发送给 kernel 的配置
+        let cfg = self.to_kernel_cfg();
+        // 生成所有页指针
+        let cache_pages = reqs
+            .iter()
+            .flat_map(|req| {
+                let n = req.q.shape()[1];
+                let pos = req.pos;
+                (0..(pos + n).div_ceil(tile_ctx)).map(|i| {
+                    let cache = req
+                        .cache
+                        .as_ref()
+                        .transform(|layout| layout.index(0, i * tile_ctx));
+                    let base = cache.get().as_ptr();
+                    let k = cache
+                        .as_ref()
+                        .transform(|layout| layout.index(0, 0))
+                        .offset();
+                    let v = cache
+                        .as_ref()
+                        .transform(|layout| layout.index(0, 1))
+                        .offset();
+                    KVPage {
+                        k: unsafe { base.byte_offset(k).cast() },
+                        v: unsafe { base.byte_offset(v).cast() },
+                    }
                 })
-                .collect::<Box<_>>();
-            let pages = CachePages {
-                pages,
-                strides: [sbuf, skv, sh],
-                bs: tile_ctx,
-                dh: d,
-            };
-            // 生成 causal mask
-            let mask_data = (0..n * s)
-                .map(|i| i % s <= s - n + i / s)
-                .collect::<Rc<_>>();
-            let mask = Tensor::from_dim_slice(types::Bool, [n, s]).map(|_| erase_ty(&mask_data));
-            // 连接 kv cache
-            pages.concat(&k, &v, *pos);
-            let pages = Rc::new(pages);
-            // 计算注意力
-            for head in 0..h {
-                // global
-                let q = q.as_deref().transform(|l| l.index(0, head));
-                let mut o = o.as_deref_mut().transform(|l| l.index(0, head));
-                let l = vec![0.; s]; // 注意力分母
-                let m = vec![f64::NEG_INFINITY; s]; // 最大值缓存
-                // local
-                let qi = vec![0.; tile_seq * d]; // 暂存 q
-                let kj = vec![0.; tile_ctx * d]; // 暂存 k
-                let vj = vec![0.; tile_ctx * d]; // 暂存 v
-                let x = vec![0.; tile_ctx * tile_seq]; // 注意力分数
-                // block 之间完全无关，可以以任意方式并行
-                let blk = FlashAttentionBlock {
-                    head: head / g,
-                    pages: pages.clone(),
-
-                    q: Matrix::<*const f64>::from_tensor(&q),
-                    o: Matrix::<*mut f64>::from_tensor(&mut o),
-                    mask: Matrix::<*const bool>::from_tensor(&mask),
-                    l,
-                    m,
-                    qi,
-                    kj,
-                    vj,
-                    x,
+            })
+            .collect::<Vec<_>>();
+        let req_memory = reqs
+            .iter()
+            .map(|req| {
+                let n = req.q.shape()[1];
+                let pos = req.pos;
+                let s = pos + n;
+                // 注意力掩码
+                let mask = (0..n * s)
+                    .map(|i| i % s <= s - n + i / s)
+                    .collect::<Box<_>>();
+                // 注意力分母
+                let l = vec![0.; h * s];
+                // 最大值缓存
+                let m = vec![f64::NEG_INFINITY; h * s];
+                (mask, l, m)
+            })
+            .collect::<Vec<_>>();
+        // 为每个请求的每个头生成 block
+        let reqs = reqs
+            .iter()
+            .zip(&req_memory)
+            .scan(0, |start, (req, mem)| {
+                let pages_start = *start as _;
+                let n = req.q.shape()[1];
+                Some(KernelReq {
+                    q: req.q.get().as_ptr().cast(),
+                    q_strides: {
+                        destruct!([head, seq, _] = req.q.strides());
+                        Strides2D { head, seq }
+                    },
+                    pages_start,
+                    kv_strides: {
+                        destruct!([seq, _, head, _] = req.cache.strides());
+                        Strides2D { head, seq }
+                    },
+                    o: req.o.get().as_ptr().cast_mut().cast(),
+                    o_strides: {
+                        destruct!([head, seq, _] = req.o.strides());
+                        Strides2D { head, seq }
+                    },
+                    mask: mem.0.as_ptr(),
+                    l: mem.1.as_ptr().cast_mut(),
+                    m: mem.2.as_ptr().cast_mut(),
                     n,
-                    s,
-                    d,
-                    bn: tile_seq,
-                    bs: tile_ctx,
-                    scale,
-                };
-                blocks.push((mask_data.clone(), blk))
-            }
-        }
-
-        blocks.reverse(); // 验证执行顺序是无关的
-        for block in blocks {
-            block.1.launch()
+                    s: n + req.pos,
+                })
+            })
+            .collect::<Vec<_>>();
+        // 生成线程块序号
+        let mut indices = (0..reqs.len())
+            .flat_map(|ireq| (0..h).map(move |head| [ireq, head]))
+            .collect::<Vec<_>>();
+        // 以任意顺序执行
+        indices.shuffle(&mut rand::rng());
+        for [ireq, head] in indices {
+            let mut shared = vec![0.; self.shared_elements()];
+            launch_block(cfg, &cache_pages, &reqs, ireq, head, tile_seq, &mut shared)
         }
     }
 }
 
-struct CachePages {
-    pages: Box<[*mut f64]>,
-    /// \[buf, k|v, kvh]
-    strides: [isize; 3],
-    bs: usize,
-    dh: usize,
-}
-
-impl CachePages {
-    /// NOTICE GQA 需要发射此 kernel，MHA 可以合并到计算
-    fn concat(&self, k: &Tensor<&[u8]>, v: &Tensor<&[u8]>, pos: usize) {
-        destruct!([kvh_k, n_k, _d] = k.shape());
-        destruct!([kvh_v, n_v, _d] = v.shape());
-
-        let kvh = distinct(&[kvh_k, kvh_v]).unwrap();
-        let n = distinct(&[n_k, n_v]).unwrap();
-        for head in 0..kvh {
-            let k = k.as_deref().transform(|l| l.index(0, head));
-            let v = v.as_deref().transform(|l| l.index(0, head));
-
-            for i in 0..n {
-                let [k_cache, v_cache] = self.at(head, pos + i);
-                k_cache.copy_from_slice(array(k.as_deref().transform(|l| l.index(0, i))));
-                v_cache.copy_from_slice(array(v.as_deref().transform(|l| l.index(0, i))));
-            }
-        }
-    }
-
-    /// 定位指定 kv 头和位置的 token 切片
-    fn at(&self, head: usize, pos: usize) -> [&mut [f64]; 2] {
-        let [sbuf, skv, sh] = self.strides;
-        let sh = head as isize * sh;
-        let sbuf = (pos % self.bs) as isize * sbuf;
-        let k = unsafe { self.pages[pos / self.bs].byte_offset(sh + sbuf) };
-        let v = unsafe { k.byte_offset(skv) };
-        unsafe { [k, v].map(|ptr| std::slice::from_raw_parts_mut(ptr, self.dh)) }
-    }
-}
-
-struct FlashAttentionBlock {
+fn launch_block(
+    cfg: KernelCfg,
+    cache_pages: &[KVPage],
+    reqs: &[KernelReq],
+    ireq: usize,
     head: usize,
-    pages: Rc<CachePages>,
-
-    q: Matrix<*const f64>,
-    /// shape = {n, d}
-    o: Matrix<*mut f64>,
-    /// shape = {n, s}
-    mask: Matrix<*const bool>,
-    /// shape = {s}
-    l: Vec<f64>,
-    /// shape = {s}
-    m: Vec<f64>,
-    /// shape = {bn, d}
-    qi: Vec<f64>,
-    /// shape = {bs, d}
-    kj: Vec<f64>,
-    /// shape = {bs, d}
-    vj: Vec<f64>,
-    /// shape = {bn, bs}
-    x: Vec<f64>,
-
-    n: usize,
-    s: usize,
-    d: usize,
     bn: usize,
-    bs: usize,
-    scale: f64,
-}
+    shared: &mut [f64],
+) {
+    let KernelCfg { g, d, bs, scale } = cfg;
+    let &KernelReq {
+        q,
+        q_strides,
+        pages_start,
+        kv_strides,
+        o,
+        o_strides,
+        mask,
+        l,
+        m,
+        n,
+        s,
+    } = &reqs[ireq];
+    let pages = &cache_pages[pages_start..][..s.div_ceil(bs)];
 
-struct Matrix<T> {
-    ptr: T,
-    ld: isize,
-}
+    let (qi, shared) = shared.split_at_mut(bn * d);
+    let (kj, shared) = shared.split_at_mut(bs * d);
+    let (vj, x) = shared.split_at_mut(bs * d);
+    assert_eq!(x.len(), bn * bs);
 
-impl<T> Matrix<*const T> {
-    fn from_tensor(t: &Tensor<&[u8]>) -> Self {
-        destruct!([m, n] = t.strides());
-        assert_eq!(n, t.dt().nbytes() as isize);
-        Self {
-            ptr: unsafe { t.get().as_ptr().byte_offset(t.offset()).cast() },
-            ld: m / n,
-        }
-    }
-
-    fn row(&self, i: usize, d: usize) -> &[T] {
-        unsafe { std::slice::from_raw_parts(self.ptr.offset(i as isize * self.ld), d) }
-    }
-}
-
-impl<T> Matrix<*mut T> {
-    fn from_tensor(t: &mut Tensor<&mut [u8]>) -> Self {
-        destruct!([m, n] = t.strides());
-        assert_eq!(n, t.dt().nbytes() as isize);
-        Self {
-            ptr: unsafe { t.get_mut().as_mut_ptr().byte_offset(t.offset()).cast() },
-            ld: m / n,
-        }
-    }
-
-    fn row(&self, i: usize, d: usize) -> &mut [T] {
-        unsafe { std::slice::from_raw_parts_mut(self.ptr.offset(i as isize * self.ld), d) }
-    }
-}
-
-impl FlashAttentionBlock {
-    fn launch(self) {
-        let Self {
-            head,
-            pages,
-            q,
-            o,
-            mask,
-            mut l,
-            mut m,
-            mut qi,
-            mut kj,
-            mut vj,
-            mut x,
-            n,
-            s,
-            d,
-            bn,
-            bs,
-            scale,
-        } = self;
-
-        for ikvb in 0..s.div_ceil(bs) {
-            // thread
-            for it in 0..bn {
-                // 每个线程拷贝 k/v 的一行，拷贝整个 kv block 到 local memory
-                let mut ikv = ikvb * bs + it;
-                let mut i = it;
-                while ikv < (ikvb + 1) * bs {
-                    let [k, v] = pages.at(head, ikv);
-                    ikv += bn;
-
-                    kj[i * d..][..d].copy_from_slice(&k);
-                    vj[i * d..][..d].copy_from_slice(&v);
-                    i += bn;
+    for (ikvb, KVPage { k, v }) in pages.iter().enumerate() {
+        // 每个线程拷贝 k/v 的一行，拷贝整个 kv block 到 local memory
+        for it in 0..bn {
+            for i in (it..bs).step_by(bn) {
+                let offset = kv_strides.offset(head / g, i);
+                unsafe {
+                    copy_nonoverlapping(k.byte_offset(offset), kj[i * d..].as_mut_ptr(), d);
+                    copy_nonoverlapping(v.byte_offset(offset), vj[i * d..].as_mut_ptr(), d);
                 }
             }
-            // thread
-            for it in 0..bn {
-                let qi = &mut qi[it * d..][..d];
-                let x = &mut x[it * bs..][..bs];
+        }
+        // 每个线程计算 q 的一行
+        for it in 0..bn {
+            let qi = &mut qi[it * d..][..d];
+            let x = &mut x[it * bs..][..bs];
 
-                for iqb in 0..n.div_ceil(bn) {
-                    // 每个线程计算 q 的一行
-                    let iq = iqb * bn + it;
-                    if iq >= n {
-                        break;
+            for iqb in 0..n.div_ceil(bn) {
+                // 每个线程计算 q 的一行
+                let iq = iqb * bn + it;
+                if iq >= n {
+                    break;
+                }
+                // locate data
+                let q = unsafe { from_raw_parts(q.byte_offset(q_strides.offset(head, iq)), d) };
+                let o = unsafe { from_raw_parts_mut(o.byte_offset(o_strides.offset(head, iq)), d) };
+                // load data
+                qi.copy_from_slice(q);
+                let mask = unsafe { from_raw_parts(mask.add(iq * s + ikvb * bs), bs) };
+
+                let mi_1 = unsafe { *m.add(head * s + iq) };
+                let di_1 = unsafe { *l.add(head * s + iq) };
+
+                // score = q @ k^T / √d
+                let mut mi = mi_1;
+                for (i, (mask, x)) in zip(mask, &mut *x).enumerate() {
+                    if !*mask {
+                        *x = f64::NEG_INFINITY
+                    } else {
+                        let kj = &kj[i * d..][..d];
+                        *x = zip(&*qi, kj).map(|(q, k)| q * k).sum::<f64>() * scale;
+                        mi = f64::max(mi, *x)
                     }
-                    // locate data
-                    let q = q.row(iq, d);
-                    let o = o.row(iq, d);
-                    let mask = mask.row(iq, s);
-                    // load data
-                    qi.copy_from_slice(q);
-                    let mask = &mask[ikvb * bs..][..bs];
+                }
 
-                    let mi_1 = m[iq];
-                    let di_1 = l[iq];
+                let mut sum = 0.;
+                for x in &mut *x {
+                    *x = (*x - mi).exp();
+                    sum += *x
+                }
 
-                    // score = q @ k^T / √d
-                    let mut mi = mi_1;
-                    for (i, (mask, x)) in zip(mask, &mut *x).enumerate() {
-                        if !*mask {
-                            *x = f64::NEG_INFINITY
-                        } else {
-                            let kj = &kj[i * d..][..d];
-                            *x = zip(&*qi, kj).map(|(q, k)| q * k).sum::<f64>() * scale;
-                            mi = f64::max(mi, *x)
-                        }
-                    }
+                let mut exp = di_1 * (mi_1 - mi).exp();
+                let di = exp + sum;
 
-                    let mut sum = 0.;
-                    for x in &mut *x {
-                        *x = (*x - mi).exp();
-                        sum += *x
-                    }
+                unsafe { *m.add(head * s + iq) = mi };
+                unsafe { *l.add(head * s + iq) = di };
 
-                    let mut exp = di_1 * (mi_1 - mi).exp();
-                    let di = exp + sum;
+                exp /= di;
+                x.iter_mut().for_each(|x| *x /= di);
 
-                    m[iq] = mi;
-                    l[iq] = di;
-
-                    exp /= di;
-                    x.iter_mut().for_each(|x| *x /= di);
-
-                    let mut xv = vec![0.; o.len()];
-                    for (i, x) in x.iter().enumerate() {
-                        let vj = &vj[i * d..][..d];
-                        zip(&mut xv, vj).for_each(|(xv, v)| *xv += x * v)
-                    }
-                    for (o, xv) in zip(o, xv) {
-                        *o = *o * exp + xv
-                    }
+                let xv = &mut *qi;
+                xv.fill(0.);
+                for (i, x) in x.iter().enumerate() {
+                    let vj = &vj[i * d..][..d];
+                    zip(&mut *xv, vj).for_each(|(xv, v)| *xv += x * v)
+                }
+                for (o, xv) in zip(o, xv) {
+                    *o = *o * exp + *xv
                 }
             }
         }

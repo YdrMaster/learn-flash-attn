@@ -6,6 +6,4 @@ authors = ["YdrMaster <ydrml@hotmail.com>"]
 
 [dependencies]
 any-tensor = "0.0"
-
-[dev-dependencies]
 rand = "0.9"

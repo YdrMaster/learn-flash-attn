@@ -1,4 +1,6 @@
 #include <cuda/std/cstddef>
+#include <cuda/std/cstdint>
+#include <math_constants.h>
 
 using Tdata = double;
 
@@ -69,6 +71,7 @@ extern "C" __global__ void flash_attn(
           *x = vj + bs * d;
 
     size_t const ikvb_end = div_ceil(req.s, bs);
+    size_t const tn = div_ceil(req.n, bn);
     for (size_t ikvb = 0; ikvb < ikvb_end; ++ikvb) {
         Tdata const
             *k = (cache_pages + req.pages_start + ikvb)->k,
@@ -80,9 +83,63 @@ extern "C" __global__ void flash_attn(
             memcpy(vj + i * d, byte_offset(v, offset), d * sizeof(Tdata));
         }
         __syncthreads();
-        {
-            // TODO
+        // 加载每个block私有的qi，x
+        Tdata *qi_b = qi + it * d;
+        Tdata *x_b = x + it * bs;
+
+        for (uint64_t iqb = 0; iqb < tn; ++iqb) {
+            uint64_t iq = iqb * bn + it;
+            if (iq >= req.n) {
+                continue;
+            }
+            // 加载数据
+            memcpy(qi_b, byte_offset(req.q, req.q_strides.offset(head, iq)), d * sizeof(Tdata));
+            Tdata *oi = byte_offset(req.o, req.o_strides.offset(head, iq));
+            Tdata mi_1 = req.m[head * req.s + iq];
+            Tdata di_1 = req.l[head * req.s + iq];
+            bool const *mask = req.mask + iq * req.s + ikvb * bs;
+            Tdata mi = mi_1;
+            for (uint64_t i = 0; i < bs; ++i) {
+                if (!mask[i]) {
+                    x_b[i] = -CUDART_INF_F;
+                } else {
+                    x_b[i] = 0;
+                    for (uint64_t j = 0; j < d; ++j) {
+                        x_b[i] += qi_b[j] * kj[i * d + j];
+                    }
+                    x_b[i] *= scale;
+                    if (x_b[i] > mi) {
+                        mi = x_b[i];
+                    }
+                }
+            }
+            Tdata sum = 0.0;
+
+            for (uint64_t i = 0; i < bs; ++i) {
+                if (mask[i]) {
+                    x_b[i] = exp(x_b[i] - mi);
+                    sum += x_b[i];
+                } else {
+                    x_b[i] = 0;
+                }
+            }
+            Tdata exp = di_1 * ::exp(mi_1 - mi);
+            Tdata di = exp + sum;
+            Tdata rdi = 1.0 / di;
+            // 更新m，l
+            req.m[head * req.s + iq] = mi;
+            req.l[head * req.s + iq] = di;
+
+            Tdata factor = exp * rdi;
+            for (uint64_t j = 0; j < d; ++j) {
+                Tdata v_acc = 0.0;
+                for (uint64_t i = 0; i < bs; ++i) {
+                    if (mask[i]) {
+                        v_acc += x_b[i] * vj[i * d + j] * rdi;
+                    }
+                }
+                oi[j] = oi[j] * factor + v_acc;
+            }
         }
-        __syncthreads();
     }
 }

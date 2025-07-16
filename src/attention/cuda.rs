@@ -1,10 +1,13 @@
 ﻿use super::{Attention, destruct};
-use crate::attention::{
-    FlashAttnCfg, cache_concat,
-    kernel::{KVPage, KernelReq, Strides2D},
+use crate::{
+    attention::{
+        FlashAttnCfg, cache_concat,
+        kernel::{KVPage, KernelReq, Strides2D},
+    },
+    softmax::S,
 };
 use cuda::{Ptx, Stream, params};
-use std::ffi::c_uint;
+use std::{ffi::c_uint, iter::zip};
 
 impl FlashAttnCfg {
     pub fn compute_cuda(&self, reqs: &mut [Attention], stream: &Stream) {
@@ -13,7 +16,7 @@ impl FlashAttnCfg {
             cache_concat(&req.k, &req.v, &mut req.cache, req.pos)
         }
         // 生成 GPU 版本
-        let reqs_ = reqs
+        let reqs_o = reqs
             .iter()
             .map(|req| {
                 (
@@ -34,7 +37,7 @@ impl FlashAttnCfg {
         // 生成发送给 kernel 的配置
         let cfg = self.to_kernel_cfg();
         // 生成所有页指针
-        let cache_pages = reqs_
+        let cache_pages = reqs_o
             .iter()
             .flat_map(|(q, _, cache, pos)| {
                 let n = q.shape()[1];
@@ -59,7 +62,7 @@ impl FlashAttnCfg {
             })
             .collect::<Vec<_>>();
         // 生成 workspace
-        let req_memory = reqs_
+        let req_memory = reqs_o
             .iter()
             .map(|(q, _, _, pos)| {
                 let n = q.shape()[1];
@@ -80,7 +83,7 @@ impl FlashAttnCfg {
             })
             .collect::<Vec<_>>();
         // 为每个请求的每个头生成 block
-        let reqs_ = reqs_
+        let reqs_ = reqs_o
             .iter()
             .zip(&req_memory)
             .scan(0, |start, ((q, o, cache, pos), mem)| {
@@ -139,6 +142,9 @@ impl FlashAttnCfg {
             &params![cfg, cache_pages.as_ptr(), reqs_.as_ptr()].to_ptrs(),
         );
 
-        todo!()
+        zip(reqs_o, reqs).into_iter().for_each(|(g, c)| {
+            stream.memcpy_d2h(c.o.get_mut(), g.1.get());
+        });
+        stream.synchronize();
     }
 }

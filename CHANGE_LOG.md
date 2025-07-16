@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.9] - 2025-07-16
+
+### Changed
+
+- 重构 flash attention，添加一系列具有 `Clone + Copy + repr(C)` 的结构体，可在 CPU 和 GPU 实现中复用；
+- 对 CPU 执行顺序做 shuffle 以验证任意性；
+
 ## [0.0.8] - 2025-06-25
 
 ### Added
@@ -68,7 +75,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - 创建项目；
 - 实现基本的 online softmax；
 
-[Unreleased]: https://github.com/YdrMaster/learn-flash-attn/compare/v0.0.8...HEAD
+[Unreleased]: https://github.com/YdrMaster/learn-flash-attn/compare/v0.0.9...HEAD
+[0.0.9]: https://github.com/YdrMaster/learn-flash-attn/compare/v0.0.8...v0.0.9
 [0.0.8]: https://github.com/YdrMaster/learn-flash-attn/compare/v0.0.7...v0.0.8
 [0.0.7]: https://github.com/YdrMaster/learn-flash-attn/compare/v0.0.6...v0.0.7
 [0.0.6]: https://github.com/YdrMaster/learn-flash-attn/compare/v0.0.5...v0.0.6

@@ -3,7 +3,7 @@ use crate::attention::{
     FlashAttnCfg, cache_concat,
     kernel::{KVPage, KernelReq, Strides2D},
 };
-use cuda::{Ptx, Stream, params};
+use cuda::{CurrentCtx, Module, Ptx, Stream, params};
 use std::{ffi::c_uint, iter::zip};
 
 impl FlashAttnCfg {
@@ -112,21 +112,8 @@ impl FlashAttnCfg {
             .collect::<Vec<_>>();
         let cache_pages = stream.from_host(&cache_pages);
         let reqs_ = stream.from_host(&reqs_);
-
         // 编译
-        const CODE: &str = include_str!("kernel.cu");
-        let cc = stream.ctx().dev().compute_capability();
-        let (ptx, log) = Ptx::compile(CODE, cc);
-        let ptx = match ptx {
-            Ok(ptx) => {
-                if !log.is_empty() {
-                    println!("{log}")
-                }
-                ptx
-            }
-            Err(e) => panic!("{e:?}\n{log}"),
-        };
-        let module = stream.ctx().load(&ptx);
+        let module = compile("double", "double", stream.ctx());
         let kernel = module.get_kernel(c"flash_attn");
 
         stream.launch(
@@ -143,4 +130,29 @@ impl FlashAttnCfg {
             stream.memcpy_d2h(c.o.get_mut(), g.1.get());
         }
     }
+}
+
+fn compile<'ctx>(t_compute: &str, t_data: &str, ctx: &'ctx CurrentCtx) -> Module<'ctx> {
+    const CODE: &str = include_str!("kernel.cuh");
+    let code = format!(
+        r#"{CODE}
+extern "C" __global__ void flash_attn(
+    KernelCfg cfg,
+    KVPage<{t_data}> const *cache_pages,
+    KernelReq<{t_data}> const *reqs) {{
+    flash_attn_block<{t_compute}>(cfg, cache_pages, reqs);
+}}"#
+    );
+    let cc = ctx.dev().compute_capability();
+    let (ptx, log) = Ptx::compile(code, cc);
+    let ptx = match ptx {
+        Ok(ptx) => {
+            if !log.is_empty() {
+                println!("{log}")
+            }
+            ptx
+        }
+        Err(e) => panic!("{e:?}\n{log}"),
+    };
+    ctx.load(&ptx)
 }

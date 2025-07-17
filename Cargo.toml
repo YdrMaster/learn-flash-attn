@@ -1,6 +1,6 @@
 [package]
 name = "learn-flash-attn"
-version = "0.0.9"
+version = "0.0.10"
 edition = "2024"
 authors = ["YdrMaster <ydrml@hotmail.com>"]
 

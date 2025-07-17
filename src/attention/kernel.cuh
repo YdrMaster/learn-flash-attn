@@ -151,12 +151,3 @@ __device__ void flash_attn_block(
         }
     }
 }
-
-using Tcompute = double;
-using Tdata = double;
-extern "C" __global__ void flash_attn(
-    KernelCfg cfg,
-    KVPage<Tdata> const *cache_pages,
-    KernelReq<Tdata> const *reqs) {
-    flash_attn_block<Tcompute>(cfg, cache_pages, reqs);
-}

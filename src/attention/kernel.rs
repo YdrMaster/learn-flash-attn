@@ -6,7 +6,7 @@ pub(super) struct KernelCfg {
     pub g: usize,
     pub d: usize,
     pub bs: usize,
-    pub scale: Tdata,
+    pub scale: f32,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -61,7 +61,7 @@ impl super::FlashAttnCfg {
             g: h / kvh,
             d,
             bs: tile_ctx,
-            scale: (d as f64).sqrt().recip(),
+            scale: (d as f32).sqrt().recip(),
         }
     }
 

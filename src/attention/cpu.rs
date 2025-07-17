@@ -137,12 +137,12 @@ fn launch_block(
         s,
     } = &reqs[ireq];
     let pages = &cache_pages[pages_start..][..s.div_ceil(bs)];
-
+    // 划分 shared memory
     let (qi, shared) = shared.split_at_mut(bn * d);
     let (kj, shared) = shared.split_at_mut(bs * d);
     let (vj, x) = shared.split_at_mut(bs * d);
     assert_eq!(x.len(), bn * bs);
-
+    // ctx 方向迭代
     for (ikvb, KVPage { k, v }) in pages.iter().enumerate() {
         // 每个线程拷贝 k/v 的一行，拷贝整个 kv block 到 local memory
         for it in 0..bn {
@@ -158,9 +158,8 @@ fn launch_block(
         for it in 0..bn {
             let qi = &mut qi[it * d..][..d];
             let x = &mut x[it * bs..][..bs];
-
+            // seq 方向迭代
             for iqb in 0..n.div_ceil(bn) {
-                // 每个线程计算 q 的一行
                 let iq = iqb * bn + it;
                 if iq >= n {
                     break;
@@ -172,8 +171,10 @@ fn launch_block(
                 qi.copy_from_slice(q);
                 let mask = unsafe { from_raw_parts(mask.add(iq * s + ikvb * bs), bs) };
 
-                let mi_1 = unsafe { *m.add(head * s + iq) };
-                let di_1 = unsafe { *l.add(head * s + iq) };
+                let m = unsafe { m.add(head * s + iq) };
+                let l = unsafe { l.add(head * s + iq) };
+                let mi_1 = unsafe { *m };
+                let di_1 = unsafe { *l };
 
                 // score = q @ k^T / √d
                 let mut mi = mi_1;
@@ -181,9 +182,14 @@ fn launch_block(
                     if !*mask {
                         *x = f64::NEG_INFINITY
                     } else {
-                        let kj = &kj[i * d..][..d];
-                        *x = zip(&*qi, kj).map(|(q, k)| q * k).sum::<f64>() * scale;
-                        mi = f64::max(mi, *x)
+                        let qk = zip(&*qi, &kj[i * d..][..d])
+                            .map(|(q, k)| q * k)
+                            .sum::<f64>()
+                            * scale as f64;
+                        *x = qk;
+                        if qk > mi {
+                            mi = qk
+                        }
                     }
                 }
 
@@ -193,23 +199,19 @@ fn launch_block(
                     sum += *x
                 }
 
-                let mut exp = di_1 * (mi_1 - mi).exp();
+                let exp = di_1 * (mi_1 - mi).exp();
                 let di = exp + sum;
+                // 更新 m, l
+                unsafe { *m = mi };
+                unsafe { *l = di };
 
-                unsafe { *m.add(head * s + iq) = mi };
-                unsafe { *l.add(head * s + iq) = di };
-
-                exp /= di;
-                x.iter_mut().for_each(|x| *x /= di);
-
-                let xv = &mut *qi;
-                xv.fill(0.);
-                for (i, x) in x.iter().enumerate() {
-                    let vj = &vj[i * d..][..d];
-                    zip(&mut *xv, vj).for_each(|(xv, v)| *xv += x * v)
-                }
-                for (o, xv) in zip(o, xv) {
-                    *o = *o * exp + *xv
+                for (j, o) in o.iter_mut().enumerate() {
+                    let xv = x
+                        .iter()
+                        .enumerate()
+                        .map(|(i, x)| *x * vj[i * d + j])
+                        .sum::<f64>();
+                    *o = (*o * exp + xv) / di
                 }
             }
         }

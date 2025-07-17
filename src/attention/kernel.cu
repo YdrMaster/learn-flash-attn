@@ -1,8 +1,4 @@
 #include <cuda/std/cstddef>
-#include <cuda/std/cstdint>
-#include <math_constants.h>
-
-using Tdata = double;
 
 __device__ size_t div_ceil(size_t a, size_t b) {
     return (a + b - 1) / b;
@@ -15,11 +11,12 @@ __device__ T *byte_offset(T *ptr, ptrdiff_t diff) {
 
 struct KernelCfg {
     size_t g, d, bs;
-    Tdata scale;
+    float scale;
 };
 
+template <typename T>
 struct KVPage {
-    Tdata *k, *v;
+    T *k, *v;
 };
 
 struct Strides2D {
@@ -30,22 +27,28 @@ struct Strides2D {
     }
 };
 
+template <typename T>
 struct KernelReq {
-    Tdata const *q;
+    // qurey
+    T const *q;
     Strides2D q_strides;
+    // kv (paged)
     size_t pages_start;
     Strides2D kv_strides;
-    Tdata *o;
+    // output
+    T *o;
     Strides2D o_strides;
+    // config
     bool *const mask;
-    Tdata *l, *m;
+    T *l, *m;
     size_t n, s;
 };
 
-extern "C" __global__ void flash_attn(
+template <typename Tcompute, typename T>
+__device__ void flash_attn_block(
     KernelCfg cfg,
-    KVPage const *cache_pages,
-    KernelReq const *reqs) {
+    KVPage<T> const *cache_pages,
+    KernelReq<T> const *reqs) {
     size_t const
         ireq = blockIdx.y,
         head = blockIdx.x,
@@ -56,90 +59,104 @@ extern "C" __global__ void flash_attn(
         g = cfg.g,
         d = cfg.d,
         bs = cfg.bs;
-    Tdata const
+    float const
         scale = cfg.scale;
-
     KernelReq const
         req = reqs[ireq];
-    KVPage const *
-        pages = cache_pages + req.pages_start;
+    // 划分 shared memory
+    extern __shared__ T shared[];
+    T *qi = shared,
+      *kj = qi + bn * d,
+      *vj = kj + bs * d,
+      *x = vj + bs * d;
+    // 定位每个线程的 qi, x
+    qi += it * d;
+    x += it * bs;
 
-    extern __shared__ Tdata shared[];
-    Tdata *qi = shared,
-          *kj = qi + bn * d,
-          *vj = kj + bs * d,
-          *x = vj + bs * d;
-
-    size_t const ikvb_end = div_ceil(req.s, bs);
-    size_t const tn = div_ceil(req.n, bn);
+    size_t const
+        ikvb_end = div_ceil(req.s, bs),
+        iqb_end = div_ceil(req.n, bn);
+    // ctx 方向迭代
     for (size_t ikvb = 0; ikvb < ikvb_end; ++ikvb) {
-        Tdata const
-            *k = (cache_pages + req.pages_start + ikvb)->k,
-            *v = (cache_pages + req.pages_start + ikvb)->v;
-
-        for (size_t i = it; i < bs; i += bn) {
-            ptrdiff_t const offset = req.kv_strides.offset(head / g, i);
-            memcpy(kj + i * d, byte_offset(k, offset), d * sizeof(Tdata));
-            memcpy(vj + i * d, byte_offset(v, offset), d * sizeof(Tdata));
+        // 每个线程拷贝 k/v 的一行，拷贝整个 kv block 到 local memory
+        {
+            T const
+                *k = (cache_pages + req.pages_start + ikvb)->k,
+                *v = (cache_pages + req.pages_start + ikvb)->v;
+            for (size_t i = it; i < bs; i += bn) {
+                ptrdiff_t const offset = req.kv_strides.offset(head / g, i);
+                memcpy(kj + i * d, byte_offset(k, offset), d * sizeof(T));
+                memcpy(vj + i * d, byte_offset(v, offset), d * sizeof(T));
+            }
         }
         __syncthreads();
-        // 加载每个block私有的qi，x
-        Tdata *qi_b = qi + it * d;
-        Tdata *x_b = x + it * bs;
-
-        for (uint64_t iqb = 0; iqb < tn; ++iqb) {
-            uint64_t iq = iqb * bn + it;
+        // seq 方向迭代
+        for (size_t iqb = 0; iqb < iqb_end; ++iqb) {
+            // 每个线程计算 q 的一行
+            size_t iq = iqb * bn + it;
             if (iq >= req.n) {
                 continue;
             }
-            // 加载数据
-            memcpy(qi_b, byte_offset(req.q, req.q_strides.offset(head, iq)), d * sizeof(Tdata));
-            Tdata *oi = byte_offset(req.o, req.o_strides.offset(head, iq));
-            Tdata mi_1 = req.m[head * req.s + iq];
-            Tdata di_1 = req.l[head * req.s + iq];
+            // locate data
+            T const *q_ = byte_offset(req.q, req.q_strides.offset(head, iq));
+            T /***/ *o_ = byte_offset(req.o, req.o_strides.offset(head, iq));
+            // load data
+            memcpy(qi, q_, d * sizeof(T));
             bool const *mask = req.mask + iq * req.s + ikvb * bs;
-            Tdata mi = mi_1;
-            for (uint64_t i = 0; i < bs; ++i) {
-                if (!mask[i]) {
-                    x_b[i] = -CUDART_INF_F;
-                } else {
-                    x_b[i] = 0;
-                    for (uint64_t j = 0; j < d; ++j) {
-                        x_b[i] += qi_b[j] * kj[i * d + j];
-                    }
-                    x_b[i] *= scale;
-                    if (x_b[i] > mi) {
-                        mi = x_b[i];
-                    }
-                }
-            }
-            Tdata sum = 0.0;
 
-            for (uint64_t i = 0; i < bs; ++i) {
+            T *m = req.m + head * req.s + iq,
+              *l = req.l + head * req.s + iq;
+            Tcompute const mi_1 = *m,
+                           di_1 = *l;
+
+            // score = q @ k^T / √d
+            Tcompute mi = mi_1;
+            for (size_t i = 0; i < bs; ++i) {
                 if (mask[i]) {
-                    x_b[i] = exp(x_b[i] - mi);
-                    sum += x_b[i];
-                } else {
-                    x_b[i] = 0;
-                }
-            }
-            Tdata exp = di_1 * ::exp(mi_1 - mi);
-            Tdata di = exp + sum;
-            Tdata rdi = 1.0 / di;
-            // 更新m，l
-            req.m[head * req.s + iq] = mi;
-            req.l[head * req.s + iq] = di;
-
-            Tdata factor = exp * rdi;
-            for (uint64_t j = 0; j < d; ++j) {
-                Tdata v_acc = 0.0;
-                for (uint64_t i = 0; i < bs; ++i) {
-                    if (mask[i]) {
-                        v_acc += x_b[i] * vj[i * d + j] * rdi;
+                    Tcompute qk = 0;
+                    for (size_t j = 0; j < d; ++j) {
+                        qk += qi[j] * kj[i * d + j];
+                    }
+                    qk *= scale;
+                    x[i] = qk;
+                    if (qk > mi) {
+                        mi = qk;
                     }
                 }
-                oi[j] = oi[j] * factor + v_acc;
+            }
+
+            Tcompute sum = 0;
+            for (size_t i = 0; i < bs; ++i) {
+                if (!mask[i]) {
+                    x[i] = 0;
+                } else {
+                    x[i] = ::exp(x[i] - mi);
+                    sum += x[i];
+                }
+            }
+
+            Tcompute exp = di_1 * ::exp(mi_1 - mi),
+                     di = exp + sum;
+            // 更新 m, l
+            *m = mi;
+            *l = di;
+
+            for (size_t j = 0; j < d; ++j) {
+                Tcompute xv = 0;
+                for (size_t i = 0; i < bs; ++i) {
+                    xv += x[i] * vj[i * d + j];
+                }
+                o_[j] = (o_[j] * exp + xv) / di;
             }
         }
     }
+}
+
+using Tcompute = double;
+using Tdata = double;
+extern "C" __global__ void flash_attn(
+    KernelCfg cfg,
+    KVPage<Tdata> const *cache_pages,
+    KernelReq<Tdata> const *reqs) {
+    flash_attn_block<Tcompute>(cfg, cache_pages, reqs);
 }

@@ -117,10 +117,10 @@ mod test {
     fn test_flash_attention() {
         const H: usize = 32;
         const KVH: usize = 8;
-        const N: usize = 8;
+        const N: usize = 7;
         const S: usize = 1024;
         const P: usize = S - N;
-        const D: usize = 32;
+        const D: usize = 64;
 
         const FLASH_ATTN: FlashAttnCfg = FlashAttnCfg {
             h: H,
@@ -195,11 +195,11 @@ mod test {
             }];
 
             cuda::init().unwrap();
-            cuda::Device::new(0).context().apply(move |ctx| {
-                let stream = ctx.stream();
-                FLASH_ATTN.compute_cuda(&mut reqs, &stream)
-            });
-            for (ans, res) in zip(ans, res).chain(zip(cache_ans, cache_res)) {
+            cuda::Device::new(0)
+                .context()
+                .apply(move |ctx| FLASH_ATTN.compute_cuda(&mut reqs, &ctx.stream()));
+
+            for (ans, res) in zip(ans.clone(), res).chain(zip(cache_ans.clone(), cache_res)) {
                 let e_abs = (ans - res).abs();
                 assert!(
                     e_abs < 1e3 * f64::EPSILON,

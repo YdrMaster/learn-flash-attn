@@ -1,10 +1,7 @@
 ﻿use super::{Attention, destruct};
-use crate::{
-    attention::{
-        FlashAttnCfg, cache_concat,
-        kernel::{KVPage, KernelReq, Strides2D},
-    },
-    softmax::S,
+use crate::attention::{
+    FlashAttnCfg, cache_concat,
+    kernel::{KVPage, KernelReq, Strides2D},
 };
 use cuda::{Ptx, Stream, params};
 use std::{ffi::c_uint, iter::zip};
@@ -142,9 +139,8 @@ impl FlashAttnCfg {
             &params![cfg, cache_pages.as_ptr(), reqs_.as_ptr()].to_ptrs(),
         );
 
-        zip(reqs_o, reqs).into_iter().for_each(|(g, c)| {
+        for (g, c) in zip(reqs_o, reqs) {
             stream.memcpy_d2h(c.o.get_mut(), g.1.get());
-        });
-        stream.synchronize();
+        }
     }
 }

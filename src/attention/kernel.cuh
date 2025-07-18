@@ -69,9 +69,12 @@ __device__ void flash_attn_block(
       *kj = qi + bn * d,
       *vj = kj + bs * d,
       *x = vj + bs * d;
-    // 定位每个线程的 qi, x
-    qi += it * d;
-    x += it * bs;
+    // 定位每个线程块的 m 和 l，长度 s
+    T *m = req.m + head * req.s,
+      *l = req.l + head * req.s;
+    // 定位每个线程的 qi 和 x
+    qi += it * d; // 长度 d
+    x += it * bs; // 长度 bs
 
     size_t const
         ikvb_end = div_ceil(req.s, bs),
@@ -104,10 +107,8 @@ __device__ void flash_attn_block(
             memcpy(qi, q_, d * sizeof(T));
             bool const *mask = req.mask + iq * req.s + ikvb * bs;
 
-            T *m = req.m + head * req.s + iq,
-              *l = req.l + head * req.s + iq;
-            Tcompute const mi_1 = *m,
-                           di_1 = *l;
+            Tcompute const mi_1 = m[iq],
+                           di_1 = l[iq];
 
             // score = q @ k^T / √d
             Tcompute mi = mi_1;
@@ -138,8 +139,8 @@ __device__ void flash_attn_block(
             Tcompute exp = di_1 * ::exp(mi_1 - mi),
                      di = exp + sum;
             // 更新 m, l
-            *m = mi;
-            *l = di;
+            m[iq] = mi;
+            l[iq] = di;
 
             for (size_t j = 0; j < d; ++j) {
                 Tcompute xv = 0;

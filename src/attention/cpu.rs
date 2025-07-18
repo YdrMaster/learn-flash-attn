@@ -142,6 +142,9 @@ fn launch_block(
     let (kj, shared) = shared.split_at_mut(bs * d);
     let (vj, x) = shared.split_at_mut(bs * d);
     assert_eq!(x.len(), bn * bs);
+    // 定位每个线程块的 m 和 l，长度 s
+    let m = unsafe { from_raw_parts_mut(m.add(head * s), s) };
+    let l = unsafe { from_raw_parts_mut(l.add(head * s), s) };
     // ctx 方向迭代
     for (ikvb, KVPage { k, v }) in pages.iter().enumerate() {
         // 每个线程拷贝 k/v 的一行，拷贝整个 kv block 到 local memory
@@ -171,10 +174,8 @@ fn launch_block(
                 qi.copy_from_slice(q);
                 let mask = unsafe { from_raw_parts(mask.add(iq * s + ikvb * bs), bs) };
 
-                let m = unsafe { m.add(head * s + iq) };
-                let l = unsafe { l.add(head * s + iq) };
-                let mi_1 = unsafe { *m };
-                let di_1 = unsafe { *l };
+                let mi_1 = m[iq];
+                let di_1 = l[iq];
 
                 // score = q @ k^T / √d
                 let mut mi = mi_1;
@@ -202,8 +203,8 @@ fn launch_block(
                 let exp = di_1 * (mi_1 - mi).exp();
                 let di = exp + sum;
                 // 更新 m, l
-                unsafe { *m = mi };
-                unsafe { *l = di };
+                m[iq] = mi;
+                l[iq] = di;
 
                 for (j, o) in o.iter_mut().enumerate() {
                     let xv = x

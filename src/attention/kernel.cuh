@@ -32,8 +32,13 @@ struct KernelReq {
     // qurey
     T const *q;
     Strides2D q_strides;
+    T const *k;
+    Strides2D k_strides;
+    T const *v;
+    Strides2D v_strides;
     // kv (paged)
     size_t pages_start;
+    T *kv_cache; //[buf, 2, kvh, d]
     Strides2D kv_strides;
     // output
     T *o;
@@ -79,6 +84,7 @@ __device__ void flash_attn_block(
     size_t const
         ikvb_end = div_ceil(req.s, bs),
         iqb_end = div_ceil(req.n, bn);
+
     // ctx 方向迭代
     for (size_t ikvb = 0; ikvb < ikvb_end; ++ikvb) {
         // 每个线程拷贝 k/v 的一行，拷贝整个 kv block 到 local memory
@@ -150,5 +156,38 @@ __device__ void flash_attn_block(
                 o_[j] = (o_[j] * exp + xv) / di;
             }
         }
+    }
+}
+// shape (1) (b,kvh)
+template <typename Tcompute, typename T>
+__device__ void cache_concat_kernel(
+    KernelCfg cfg,
+    KernelReq<T> const *reqs) {
+    size_t const
+        ireq = blockIdx.y,
+        kvh = blockDim.x,
+        head = threadIdx.x;
+    KernelReq const
+        req = reqs[ireq];
+    size_t const
+        pos = req.s - req.n,
+        d = cfg.d;
+
+    size_t d_size = d * sizeof(T);
+    for (size_t i = 0; i < req.n; ++i) {
+        ptrdiff_t k_offset = req.k_strides.offset(head, i);
+        ptrdiff_t v_offset = req.v_strides.offset(head, i);
+
+        ptrdiff_t c_k_offset = req.kv_strides.offset(head, pos + i);
+
+        ptrdiff_t c_v_offset = c_k_offset + req.kv_strides.head * kvh;
+
+        memcpy(byte_offset(req.kv_cache, c_k_offset),
+               byte_offset(req.k, k_offset),
+               d_size);
+
+        memcpy(byte_offset(req.kv_cache, c_v_offset),
+               byte_offset(req.v, v_offset),
+               d_size);
     }
 }

@@ -6,7 +6,7 @@ use crate::attention::{
 use rand::seq::SliceRandom;
 use std::{
     iter::zip,
-    ptr::copy_nonoverlapping,
+    ptr::{self, copy_nonoverlapping},
     slice::{from_raw_parts, from_raw_parts_mut},
 };
 
@@ -82,7 +82,13 @@ impl FlashAttnCfg {
                         destruct!([head, seq, _] = req.q.strides());
                         Strides2D { head, seq }
                     },
+                    // kv用于在gpu上进行cache_concat ，cpu上无作用
+                    k: ptr::null(),
+                    k_strides: Strides2D { head: 0, seq: 0 },
+                    v: ptr::null(),
+                    v_strides: Strides2D { head: 0, seq: 0 },
                     pages_start,
+                    kv_cache: ptr::null_mut(),
                     kv_strides: {
                         destruct!([seq, _, head, _] = req.cache.strides());
                         Strides2D { head, seq }
@@ -135,6 +141,7 @@ fn launch_block(
         m,
         n,
         s,
+        ..
     } = &reqs[ireq];
     let pages = &cache_pages[pages_start..][..s.div_ceil(bs)];
     // 划分 shared memory

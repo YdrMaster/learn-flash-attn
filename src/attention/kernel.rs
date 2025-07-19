@@ -36,7 +36,12 @@ impl Strides2D {
 pub(super) struct KernelReq {
     pub q: *const Tdata,
     pub q_strides: Strides2D,
+    pub k: *const Tdata,
+    pub k_strides: Strides2D,
+    pub v: *const Tdata,
+    pub v_strides: Strides2D,
     pub pages_start: usize,
+    pub kv_cache: *mut Tdata,
     pub kv_strides: Strides2D,
     pub o: *mut Tdata,
     pub o_strides: Strides2D,

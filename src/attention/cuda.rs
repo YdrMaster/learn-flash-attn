@@ -1,6 +1,6 @@
 ﻿use super::{Attention, destruct};
 use crate::attention::{
-    FlashAttnCfg, cache_concat,
+    FlashAttnCfg,
     kernel::{KVPage, KernelReq, Strides2D},
 };
 use cuda::{CurrentCtx, Module, Ptx, Stream, params};
@@ -8,16 +8,14 @@ use std::{ffi::c_uint, iter::zip};
 
 impl FlashAttnCfg {
     pub fn compute_cuda(&self, reqs: &mut [Attention], stream: &Stream) {
-        // 连接 kv cache
-        for req in &mut *reqs {
-            cache_concat(&req.k, &req.v, &mut req.cache, req.pos)
-        }
         // 生成 GPU 版本
         let reqs_o = reqs
             .iter()
             .map(|req| {
                 (
                     req.q.as_ref().map(|s| stream.from_host(s)),
+                    req.k.as_ref().map(|s| stream.from_host(s)),
+                    req.v.as_ref().map(|s| stream.from_host(s)),
                     req.o.as_ref().map(|s| stream.from_host(s)),
                     req.cache.as_ref().map(|s| stream.from_host(s)),
                     req.pos,
@@ -36,7 +34,7 @@ impl FlashAttnCfg {
         // 生成所有页指针
         let cache_pages = reqs_o
             .iter()
-            .flat_map(|(q, _, cache, pos)| {
+            .flat_map(|(q, _, _, _, cache, pos)| {
                 let n = q.shape()[1];
                 (0..(pos + n).div_ceil(tile_ctx)).map(|i| {
                     let cache = cache
@@ -61,7 +59,7 @@ impl FlashAttnCfg {
         // 生成 workspace
         let req_memory = reqs_o
             .iter()
-            .map(|(q, _, _, pos)| {
+            .map(|(q, _, _, _, _, pos)| {
                 let n = q.shape()[1];
                 let s = pos + n;
                 // 注意力掩码
@@ -83,7 +81,7 @@ impl FlashAttnCfg {
         let reqs_ = reqs_o
             .iter()
             .zip(&req_memory)
-            .scan(0, |start, ((q, o, cache, pos), mem)| {
+            .scan(0, |start, ((q, k, v, o, cache, pos), mem)| {
                 let pages_start = *start as _;
                 let n = q.shape()[1];
                 Some(KernelReq {
@@ -92,7 +90,19 @@ impl FlashAttnCfg {
                         destruct!([head, seq, _] = q.strides());
                         Strides2D { head, seq }
                     },
+
+                    k: k.get().as_ptr().cast(),
+                    k_strides: {
+                        destruct!([head, seq, _] = k.strides());
+                        Strides2D { head, seq }
+                    },
+                    v: v.get().as_ptr().cast(),
+                    v_strides: {
+                        destruct!([head, seq, _] = v.strides());
+                        Strides2D { head, seq }
+                    },
                     pages_start,
+                    kv_cache: cache.get().as_ptr().cast_mut().cast(),
                     kv_strides: {
                         destruct!([seq, _, head, _] = cache.strides());
                         Strides2D { head, seq }
@@ -114,6 +124,15 @@ impl FlashAttnCfg {
         let reqs_ = stream.from_host(&reqs_);
         // 编译
         let module = compile("double", "double", stream.ctx());
+        let kernel = module.get_kernel(c"cache_concat");
+        stream
+            .launch(
+                &kernel,
+                ((1 as c_uint), (reqs.len() as c_uint, self.kvh as c_uint), 0),
+                &params![cfg, reqs_.as_ptr()].to_ptrs(),
+            )
+            .synchronize();
+
         let kernel = module.get_kernel(c"flash_attn");
 
         stream.launch(
@@ -127,7 +146,8 @@ impl FlashAttnCfg {
         );
 
         for (g, c) in zip(reqs_o, reqs) {
-            stream.memcpy_d2h(c.o.get_mut(), g.1.get());
+            stream.memcpy_d2h(c.cache.get_mut(), g.4.get());
+            stream.memcpy_d2h(c.o.get_mut(), g.3.get());
         }
     }
 }
@@ -141,7 +161,14 @@ extern "C" __global__ void flash_attn(
     KVPage<{t_data}> const *cache_pages,
     KernelReq<{t_data}> const *reqs) {{
     flash_attn_block<{t_compute}>(cfg, cache_pages, reqs);
-}}"#
+}}
+
+extern "C" __global__ void cache_concat(
+    KernelCfg cfg,
+    KernelReq<{t_data}> const *reqs) {{
+    cache_concat_kernel<{t_compute}>(cfg, reqs);
+}}
+    "#
     );
     let cc = ctx.dev().compute_capability();
     let (ptx, log) = Ptx::compile(code, cc);

@@ -1,4 +1,4 @@
-﻿use super::{Attention, destruct};
+use super::{Attention, destruct};
 use crate::attention::{
     FlashAttnCfg,
     kernel::{KVPage, KernelReq, Strides2D},
@@ -128,7 +128,11 @@ impl FlashAttnCfg {
         stream
             .launch(
                 &kernel,
-                ((1 as c_uint), (reqs.len() as c_uint, self.kvh as c_uint), 0),
+                (
+                    reqs.len() as c_uint,
+                    (self.kvh as c_uint, tile_ctx as c_uint),
+                    0,
+                ),
                 &params![cfg, reqs_.as_ptr()].to_ptrs(),
             )
             .synchronize();

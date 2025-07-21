@@ -54,8 +54,13 @@ impl S {
 
 #[cfg(test)]
 pub(crate) mod test {
+    use num_traits::Float;
+
     use super::*;
-    use std::iter::zip;
+    use std::{
+        iter::zip,
+        ops::{AddAssign, DivAssign},
+    };
 
     #[test]
     fn test_online_softmax() {
@@ -77,15 +82,15 @@ pub(crate) mod test {
     }
 
     /// 标准 softmax 实现
-    pub fn safe_softmax(data: &mut [f64]) {
+    pub fn safe_softmax<T: Float + AddAssign + DivAssign>(data: &mut [T]) {
         // 找到最大值以提高数值稳定性
-        let mut max = f64::NEG_INFINITY;
+        let mut max = T::neg_infinity();
         for &x in &*data {
-            max = f64::max(max, x)
+            max = T::max(max, x)
         }
 
         // 计算指数并求和
-        let mut sum = 0.;
+        let mut sum = T::zero();
         for x in &mut *data {
             *x = (*x - max).exp();
             sum += *x

@@ -1,7 +1,11 @@
 ﻿use super::FlashAttnCfg;
 use crate::softmax::test::safe_softmax;
-use any_tensor::digit_layout::types;
-use std::iter::zip;
+use any_tensor::digit_layout::{DigitLayout, types};
+use num_traits::{Float, FromPrimitive};
+use std::{
+    iter::{Sum, zip},
+    ops::{AddAssign, DivAssign},
+};
 
 pub(super) use macros::destruct;
 
@@ -25,16 +29,27 @@ pub(super) struct Attention<'a> {
     pub pos: usize,
 }
 
+impl Attention<'_> {
+    pub fn dt(&self) -> DigitLayout {
+        let Self {
+            q, k, v, o, cache, ..
+        } = self;
+        distinct(&[q.dt(), k.dt(), v.dt(), o.dt(), cache.dt()]).unwrap()
+    }
+}
+
 pub(super) type Tensor<T> = any_tensor::Tensor<T, 3>;
 
 #[test]
 fn test_flash_attention() {
+    type Tdata = f32;
+    const DT: DigitLayout = types::F32;
     const H: usize = 32;
     const KVH: usize = 8;
     const N: usize = 7;
     const S: usize = 1024;
     const P: usize = S - N;
-    const D: usize = 64;
+    const D: usize = 128;
 
     const FLASH_ATTN: FlashAttnCfg = FlashAttnCfg {
         h: H,
@@ -44,16 +59,16 @@ fn test_flash_attention() {
         tile_ctx: 32,
     };
 
-    let q = Tensor::from_dim_slice(types::F64, [H, N, D]);
-    let o = Tensor::from_dim_slice(types::F64, [H, N, D]);
-    let k = Tensor::from_dim_slice(types::F64, [KVH, N, D]);
-    let v = Tensor::from_dim_slice(types::F64, [KVH, N, D]);
-    let cache = Tensor::from_dim_slice(types::F64, [S, 2, KVH, D]);
+    let q = Tensor::from_dim_slice(DT, [H, N, D]);
+    let o = Tensor::from_dim_slice(DT, [H, N, D]);
+    let k = Tensor::from_dim_slice(DT, [KVH, N, D]);
+    let v = Tensor::from_dim_slice(DT, [KVH, N, D]);
+    let cache = Tensor::from_dim_slice(DT, [S, 2, KVH, D]);
 
-    let q_data = random_data(H * N * D);
-    let k_data = random_data(KVH * N * D);
-    let v_data = random_data(KVH * N * D);
-    let cache_data = random_data(S * 2 * KVH * D);
+    let q_data = random_data::<Tdata>(H * N * D);
+    let k_data = random_data::<Tdata>(KVH * N * D);
+    let v_data = random_data::<Tdata>(KVH * N * D);
+    let cache_data = random_data::<Tdata>(S * 2 * KVH * D);
 
     let q = q.as_ref().map(|_| erase_ty(&q_data));
     let k = k.as_ref().map(|_| erase_ty(&k_data));
@@ -61,9 +76,9 @@ fn test_flash_attention() {
     let cache = cache.as_ref().map(|_| erase_ty(&v_data));
 
     // 计算标准 attention
-    let mut ans = vec![0.0f64; H * N * D];
+    let mut ans = vec![0.; H * N * D];
     let mut cache_ans = cache_data.clone();
-    attention(
+    attention::<Tdata>(
         q.as_deref(),
         k.as_deref(),
         v.as_deref(),
@@ -74,7 +89,7 @@ fn test_flash_attention() {
 
     // 计算 flash attention
     {
-        let mut res = vec![0.0f64; H * N * D];
+        let mut res = vec![0.; H * N * D];
         let mut cache_res = cache_data.clone();
         let mut reqs = [Attention {
             q: q.clone(),
@@ -89,15 +104,15 @@ fn test_flash_attention() {
         for (ans, res) in zip(ans.clone(), res).chain(zip(cache_ans.clone(), cache_res)) {
             let e_abs = (ans - res).abs();
             assert!(
-                e_abs < 1e3 * f64::EPSILON,
+                e_abs < 1e3 * Tdata::EPSILON,
                 "err = {e_abs:.3e} {}x",
-                e_abs / f64::EPSILON
+                e_abs / Tdata::EPSILON
             )
         }
     }
     #[cfg(cuda)]
     {
-        let mut res = vec![0.0f64; H * N * D];
+        let mut res = vec![0.; H * N * D];
         let mut cache_res = cache_data.clone();
         let mut reqs = [Attention {
             q: q.clone(),
@@ -116,26 +131,28 @@ fn test_flash_attention() {
         for (ans, res) in zip(ans.clone(), res).chain(zip(cache_ans.clone(), cache_res)) {
             let e_abs = (ans - res).abs();
             assert!(
-                e_abs < 1e3 * f64::EPSILON,
+                e_abs < 1e3 * Tdata::EPSILON,
                 "err = {e_abs:.3e} {}x",
-                e_abs / f64::EPSILON
+                e_abs / Tdata::EPSILON
             )
         }
     }
 }
 
-fn random_data(n: usize) -> Vec<f64> {
+fn random_data<T: Float + FromPrimitive>(n: usize) -> Vec<T> {
     (0..n)
-        .map(|_| (rand::random::<f64>() - 0.5) * 10.)
+        .map(|_| T::from_f32((rand::random::<f32>() - 0.5) * 10.).unwrap())
         .collect()
 }
 
 /// 连接 cache
-fn cache_concat(k: &Tensor<&[u8]>, v: &Tensor<&[u8]>, cache: &mut Tensor<&mut [u8]>, pos: usize) {
-    debug_assert!(matches!(
-        distinct(&[k.dt(), v.dt(), cache.dt()]),
-        Some(any_tensor::digit_layout::types::F64)
-    ));
+fn cache_concat<T: Copy>(
+    k: &Tensor<&[u8]>,
+    v: &Tensor<&[u8]>,
+    cache: &mut Tensor<&mut [u8]>,
+    pos: usize,
+) {
+    distinct(&[k.dt(), v.dt(), cache.dt()]).unwrap();
 
     destruct!([kvh_k, n_k, d_k] = k.shape());
     destruct!([kvh_v, n_v, d_v] = v.shape());
@@ -154,16 +171,16 @@ fn cache_concat(k: &Tensor<&[u8]>, v: &Tensor<&[u8]>, cache: &mut Tensor<&mut [u
 
         for i in 0..n {
             let mut cache = cache.as_deref_mut().transform(|l| l.index(0, pos + i));
-            let k = array::<f64>(k.as_deref().transform(|l| l.index(0, i)));
-            let v = array::<f64>(v.as_deref().transform(|l| l.index(0, i)));
-            array_mut::<f64>(cache.as_deref_mut().transform(|l| l.index(0, 0))).copy_from_slice(k);
-            array_mut::<f64>(cache.as_deref_mut().transform(|l| l.index(0, 1))).copy_from_slice(v);
+            let k = array::<T>(k.as_deref().transform(|l| l.index(0, i)));
+            let v = array::<T>(v.as_deref().transform(|l| l.index(0, i)));
+            array_mut::<T>(cache.as_deref_mut().transform(|l| l.index(0, 0))).copy_from_slice(k);
+            array_mut::<T>(cache.as_deref_mut().transform(|l| l.index(0, 1))).copy_from_slice(v);
         }
     }
 }
 
 /// 多头注意力计算
-pub fn attention(
+pub fn attention<T: Float + FromPrimitive + AddAssign + DivAssign + Sum>(
     q: Tensor<&[u8]>,
     k: Tensor<&[u8]>,
     v: Tensor<&[u8]>,
@@ -172,8 +189,7 @@ pub fn attention(
     pos: usize,
 ) {
     // 对齐数据类型
-    let dt = distinct(&[q.dt(), k.dt(), v.dt(), o.dt(), cache.dt()]).unwrap();
-    assert_eq!(dt, types::F64);
+    let _ = distinct(&[q.dt(), k.dt(), v.dt(), o.dt(), cache.dt()]).unwrap();
     // 解构形状维度
     destruct!([h_q, n_q, d_q] = q.shape());
     destruct!([h_o, n_o, d_o] = o.shape());
@@ -190,9 +206,9 @@ pub fn attention(
     // 计算标量参数
     assert_eq!(h % kvh, 0);
     let g = h / kvh;
-    let scale = (d as f64).sqrt().recip();
+    let scale = T::from_usize(d).unwrap().sqrt().recip();
     // 连接 kv cache
-    cache_concat(&k, &v, &mut cache, pos);
+    cache_concat::<T>(&k, &v, &mut cache, pos);
     // 计算注意力
     let k = cache.as_deref().transform(|l| l.index(1, 0));
     let v = cache.as_deref().transform(|l| l.index(1, 1));
@@ -203,22 +219,22 @@ pub fn attention(
         let mut o = o.as_deref_mut().transform(|l| l.index(0, i));
 
         for i in 0..n {
-            let mut score = vec![0.; s];
-            let q = array::<f64>(q.as_deref().transform(|l| l.index(0, i)));
-            let o = array_mut::<f64>(o.as_deref_mut().transform(|l| l.index(0, i)));
+            let mut score = vec![T::zero(); s];
+            let q = array::<T>(q.as_deref().transform(|l| l.index(0, i)));
+            let o = array_mut::<T>(o.as_deref_mut().transform(|l| l.index(0, i)));
             // score = q @ k^T / √d
             let len = s - n + i + 1;
             for (i, score) in score.iter_mut().enumerate().take(len) {
-                let k = array::<f64>(k.as_deref().transform(|l| l.index(0, i)));
-                *score = zip(q, k).map(|(q, k)| q * k).sum::<f64>() * scale
+                let k = array::<T>(k.as_deref().transform(|l| l.index(0, i)));
+                *score = zip(q, k).map(|(&q, &k)| q * k).sum::<T>() * scale
             }
             // causal softmax
             safe_softmax(&mut score[..len]);
             // o = a @ v // 乘法不连续
-            o.fill(0.);
-            for (i, score) in score.iter().enumerate().take(len) {
-                let v = array::<f64>(v.as_deref().transform(|l| l.index(0, i)));
-                for (v, o) in zip(v, &mut *o) {
+            o.fill(T::zero());
+            for (i, &score) in score.iter().enumerate().take(len) {
+                let v = array::<T>(v.as_deref().transform(|l| l.index(0, i)));
+                for (&v, o) in zip(v, &mut *o) {
                     *o += score * v
                 }
             }
@@ -234,7 +250,7 @@ fn erase_ty_mut<T: Copy>(data: &mut [T]) -> &mut [u8] {
     unsafe { std::slice::from_raw_parts_mut(data.as_mut_ptr().cast(), size_of_val(data)) }
 }
 
-fn distinct<T: Eq + Copy>(val: &[T]) -> Option<T> {
+pub(super) fn distinct<T: Eq + Copy>(val: &[T]) -> Option<T> {
     let [ans, tail @ ..] = val else {
         return None;
     };

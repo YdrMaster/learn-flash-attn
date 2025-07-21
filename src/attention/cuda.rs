@@ -40,6 +40,24 @@ impl super::FlashAttnCfg {
         reqs: &mut [super::test::Attention],
         stream: &cuda::Stream,
     ) {
+        use crate::attention::test::distinct;
+        use any_tensor::digit_layout::types;
+
+        let dt = reqs.iter().map(|req| req.dt()).collect::<Box<_>>();
+        match distinct(&dt).unwrap() {
+            types::F32 => self.test_compute_cuda_::<f32>(reqs, "float", "float", stream),
+            types::F64 => self.test_compute_cuda_::<f64>(reqs, "double", "double", stream),
+            others => panic!("Unsupported data type {others}"),
+        }
+    }
+
+    fn test_compute_cuda_<T: num_traits::Float>(
+        &self,
+        reqs: &mut [super::test::Attention],
+        t_compute: &str,
+        t_data: &str,
+        stream: &cuda::Stream,
+    ) {
         use super::{KVPage, KernelReq, Strides2D, test::destruct};
         use cuda::params;
         use std::{ffi::c_uint, iter::zip};
@@ -86,7 +104,7 @@ impl super::FlashAttnCfg {
                         .as_ref()
                         .transform(|layout| layout.index(0, 1))
                         .offset();
-                    KVPage {
+                    KVPage::<T> {
                         k: unsafe { base.byte_offset(k).cast_mut().cast() },
                         v: unsafe { base.byte_offset(v).cast_mut().cast() },
                     }
@@ -106,7 +124,7 @@ impl super::FlashAttnCfg {
                 // 注意力分母
                 let l = vec![0.; h * s];
                 // 最大值缓存
-                let m = vec![f64::NEG_INFINITY; h * s];
+                let m = vec![T::neg_infinity(); h * s];
                 (
                     stream.from_host(&mask),
                     stream.from_host(&l),
@@ -121,8 +139,8 @@ impl super::FlashAttnCfg {
             .scan(0, |start, ((q, k, v, o, cache, pos), mem)| {
                 let pages_start = *start as _;
                 let n = q.shape()[1];
-                Some(KernelReq {
-                    q: q.get().as_ptr().cast::<f64>(),
+                Some(KernelReq::<T> {
+                    q: q.get().as_ptr().cast(),
                     q_strides: {
                         destruct!([head, seq, _] = q.strides());
                         Strides2D { head, seq }
@@ -159,7 +177,7 @@ impl super::FlashAttnCfg {
         let cache_pages = stream.from_host(&cache_pages);
         let reqs_ = stream.from_host(&reqs_);
         // 编译
-        let module = compile("double", "double", stream.ctx());
+        let module = compile(t_compute, t_data, stream.ctx());
         let params = params![cfg, cache_pages.as_ptr(), reqs_.as_ptr()];
 
         stream
@@ -173,7 +191,7 @@ impl super::FlashAttnCfg {
                 (
                     (reqs.len() as c_uint, h as c_uint),
                     tile_seq as c_uint,
-                    self.shared_elements() * size_of::<f64>(),
+                    self.shared_elements() * size_of::<T>(),
                 ),
                 &params.to_ptrs(),
             );

@@ -1,14 +1,16 @@
 ﻿use crate::attention::{KVPage, KernelCfg, KernelReq};
+use num_traits::{Float, FromPrimitive};
 use std::{
-    iter::zip,
+    iter::{Sum, zip},
+    ops::AddAssign,
     ptr::copy_nonoverlapping,
     slice::{from_raw_parts, from_raw_parts_mut},
 };
 
-pub fn cache_concat_block(
+pub fn cache_concat_block<T: Copy>(
     cfg: KernelCfg,
-    cache_pages: &[KVPage],
-    reqs: &[KernelReq],
+    cache_pages: &[KVPage<T>],
+    reqs: &[KernelReq<T>],
     ireq: usize,
     head: usize,
 ) {
@@ -40,16 +42,17 @@ pub fn cache_concat_block(
     }
 }
 
-pub fn flash_attn_block(
+pub fn flash_attn_block<T: Float + FromPrimitive + AddAssign + Sum<T>>(
     cfg: KernelCfg,
-    cache_pages: &[KVPage],
-    reqs: &[KernelReq],
+    cache_pages: &[KVPage<T>],
+    reqs: &[KernelReq<T>],
     ireq: usize,
     head: usize,
     bn: usize,
-    shared: &mut [f64],
+    shared: &mut [T],
 ) {
     let KernelCfg { g, d, bs, scale } = cfg;
+    let scale = T::from_f32(scale).unwrap();
     let &KernelReq {
         q,
         q_strides,
@@ -110,9 +113,9 @@ pub fn flash_attn_block(
                 for (i, (mask, x)) in zip(mask, &mut *x).enumerate() {
                     if *mask {
                         let qk = zip(&*qi, &kj[i * d..][..d])
-                            .map(|(q, k)| q * k)
-                            .sum::<f64>()
-                            * scale as f64;
+                            .map(|(&q, &k)| q * k)
+                            .sum::<T>()
+                            * scale;
                         *x = qk;
                         if qk > mi {
                             mi = qk
@@ -120,10 +123,10 @@ pub fn flash_attn_block(
                     }
                 }
 
-                let mut sum = 0.;
+                let mut sum = T::zero();
                 for (mask, x) in zip(mask, &mut *x) {
                     if !*mask {
-                        *x = 0.
+                        *x = T::zero()
                     } else {
                         *x = (*x - mi).exp();
                         sum += *x
@@ -141,7 +144,7 @@ pub fn flash_attn_block(
                         .iter()
                         .enumerate()
                         .map(|(i, x)| *x * vj[i * d + j])
-                        .sum::<f64>();
+                        .sum::<T>();
                     *o = (*o * exp + xv) / di
                 }
             }
@@ -152,6 +155,21 @@ pub fn flash_attn_block(
 #[cfg(test)]
 impl super::FlashAttnCfg {
     pub(super) fn test_compute_cpu(&self, reqs: &mut [super::test::Attention]) {
+        use crate::attention::test::distinct;
+        use any_tensor::digit_layout::types;
+
+        let dt = reqs.iter().map(|req| req.dt()).collect::<Box<_>>();
+        match distinct(&dt).unwrap() {
+            types::F32 => self.test_compute_cpu_::<f32>(reqs),
+            types::F64 => self.test_compute_cpu_::<f64>(reqs),
+            others => panic!("Unsupported data type {others}"),
+        }
+    }
+
+    fn test_compute_cpu_<T: Float + FromPrimitive + AddAssign + Sum<T>>(
+        &self,
+        reqs: &mut [super::test::Attention],
+    ) {
         use super::{
             Strides2D,
             test::{Attention, destruct},
@@ -206,9 +224,9 @@ impl super::FlashAttnCfg {
                     .map(|i| i % s <= s - n + i / s)
                     .collect::<Box<_>>();
                 // 注意力分母
-                let l = vec![0.; h * s];
+                let l = vec![T::zero(); h * s];
                 // 最大值缓存
-                let m = vec![f64::NEG_INFINITY; h * s];
+                let m = vec![T::neg_infinity(); h * s];
                 (mask, l, m)
             })
             .collect::<Box<_>>();
@@ -263,7 +281,7 @@ impl super::FlashAttnCfg {
             .collect::<Box<_>>()
             .into_par_iter()
             .for_each(|&[ireq, head]| {
-                let mut shared = vec![0.; self.shared_elements()];
+                let mut shared = vec![T::zero(); self.shared_elements()];
                 flash_attn_block(cfg, &cache_pages, &reqs, ireq, head, tile_seq, &mut shared)
             });
     }

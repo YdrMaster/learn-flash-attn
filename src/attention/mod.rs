@@ -3,8 +3,6 @@
 #[cfg(cuda)]
 pub mod cuda;
 
-type Tdata = f64;
-
 #[derive(Clone, Debug)]
 pub struct FlashAttnCfg {
     pub h: usize,
@@ -25,12 +23,12 @@ pub struct KernelCfg {
 
 #[derive(Clone, Copy, Debug)]
 #[repr(C)]
-pub struct KVPage {
-    pub k: *mut Tdata,
-    pub v: *mut Tdata,
+pub struct KVPage<T> {
+    pub k: *mut T,
+    pub v: *mut T,
 }
 
-unsafe impl Sync for KVPage {}
+unsafe impl<T: Copy> Sync for KVPage<T> {}
 
 #[derive(Clone, Copy, Debug)]
 #[repr(C)]
@@ -47,25 +45,25 @@ impl Strides2D {
 
 #[derive(Clone, Copy, Debug)]
 #[repr(C)]
-pub struct KernelReq {
-    pub q: *const Tdata,
+pub struct KernelReq<T> {
+    pub q: *const T,
     pub q_strides: Strides2D,
-    pub k: *const Tdata,
+    pub k: *const T,
     pub k_strides: Strides2D,
-    pub v: *const Tdata,
+    pub v: *const T,
     pub v_strides: Strides2D,
     pub pages_start: usize,
     pub kv_strides: Strides2D,
-    pub o: *mut Tdata,
+    pub o: *mut T,
     pub o_strides: Strides2D,
     pub mask: *const bool,
-    pub l: *mut Tdata,
-    pub m: *mut Tdata,
+    pub l: *mut T,
+    pub m: *mut T,
     pub n: usize,
     pub s: usize,
 }
 
-unsafe impl Sync for KernelReq {}
+unsafe impl<T: Copy> Sync for KernelReq<T> {}
 
 impl FlashAttnCfg {
     pub fn to_kernel_cfg(&self) -> KernelCfg {

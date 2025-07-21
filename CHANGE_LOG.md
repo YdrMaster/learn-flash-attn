@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.11] - 2025-07-21
+
+### Changed
+
+- 添加支持分页和边长批次的 kv cache 连接 kernel；
+- 使用 rayon 使 CPU 在 block 级别并行计算；
+
 ## [0.0.10] - 2025-07-17
 
 ### Add
@@ -81,7 +88,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - 创建项目；
 - 实现基本的 online softmax；
 
-[Unreleased]: https://github.com/YdrMaster/learn-flash-attn/compare/v0.0.10...HEAD
+[Unreleased]: https://github.com/YdrMaster/learn-flash-attn/compare/v0.0.11...HEAD
+[0.0.11]: https://github.com/YdrMaster/learn-flash-attn/compare/v0.0.10...v0.0.11
 [0.0.10]: https://github.com/YdrMaster/learn-flash-attn/compare/v0.0.9...v0.0.10
 [0.0.9]: https://github.com/YdrMaster/learn-flash-attn/compare/v0.0.8...v0.0.9
 [0.0.8]: https://github.com/YdrMaster/learn-flash-attn/compare/v0.0.7...v0.0.8

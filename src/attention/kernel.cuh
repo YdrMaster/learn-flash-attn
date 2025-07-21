@@ -130,7 +130,7 @@ __device__ void flash_attn_block(
             // 每个线程计算 q 的一行
             size_t iq = iqb * bn + it;
             if (iq >= req.n) {
-                continue;
+                break;
             }
             // locate data
             T const *q_ = byte_offset(req.q, req.q_strides.offset(head, iq));

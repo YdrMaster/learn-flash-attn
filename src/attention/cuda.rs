@@ -1,13 +1,49 @@
-use super::{Attention, destruct};
-use crate::attention::{
-    FlashAttnCfg,
-    kernel::{KVPage, KernelReq, Strides2D},
-};
-use cuda::{CurrentCtx, Module, Ptx, Stream, params};
-use std::{ffi::c_uint, iter::zip};
+use cuda::{CurrentCtx, Module, Ptx};
 
-impl FlashAttnCfg {
-    pub fn compute_cuda(&self, reqs: &mut [Attention], stream: &Stream) {
+pub fn compile<'ctx>(t_compute: &str, t_data: &str, ctx: &'ctx CurrentCtx) -> Module<'ctx> {
+    const CODE: &str = include_str!("kernel.cuh");
+    let code = format!(
+        r#"{CODE}
+
+extern "C" __global__ void cache_concat(
+    KernelCfg cfg,
+    KVPage<{t_data}> const *cache_pages,
+    KernelReq<{t_data}> const *reqs) {{
+    cache_concat_block(cfg, cache_pages, reqs);
+}}
+
+extern "C" __global__ void flash_attn(
+    KernelCfg cfg,
+    KVPage<{t_data}> const *cache_pages,
+    KernelReq<{t_data}> const *reqs) {{
+    flash_attn_block<{t_compute}>(cfg, cache_pages, reqs);
+}}"#
+    );
+    let cc = ctx.dev().compute_capability();
+    let (ptx, log) = Ptx::compile(code, cc);
+    let ptx = match ptx {
+        Ok(ptx) => {
+            if !log.is_empty() {
+                println!("{log}")
+            }
+            ptx
+        }
+        Err(e) => panic!("{e:?}\n{log}"),
+    };
+    ctx.load(&ptx)
+}
+
+#[cfg(test)]
+impl super::FlashAttnCfg {
+    pub(super) fn test_compute_cuda(
+        &self,
+        reqs: &mut [super::test::Attention],
+        stream: &cuda::Stream,
+    ) {
+        use super::{KVPage, KernelReq, Strides2D, test::destruct};
+        use cuda::params;
+        use std::{ffi::c_uint, iter::zip};
+
         // 生成 GPU 版本
         let reqs_o = reqs
             .iter()
@@ -21,7 +57,7 @@ impl FlashAttnCfg {
                     req.pos,
                 )
             })
-            .collect::<Vec<_>>();
+            .collect::<Box<_>>();
         // 预备参数
         let &Self {
             h,
@@ -56,7 +92,7 @@ impl FlashAttnCfg {
                     }
                 })
             })
-            .collect::<Vec<_>>();
+            .collect::<Box<_>>();
         // 生成 workspace
         let req_memory = reqs_o
             .iter()
@@ -77,7 +113,7 @@ impl FlashAttnCfg {
                     stream.from_host(&m),
                 )
             })
-            .collect::<Vec<_>>();
+            .collect::<Box<_>>();
         // 为每个请求的每个头生成 block
         let reqs_ = reqs_o
             .iter()
@@ -86,7 +122,7 @@ impl FlashAttnCfg {
                 let pages_start = *start as _;
                 let n = q.shape()[1];
                 Some(KernelReq {
-                    q: q.get().as_ptr().cast(),
+                    q: q.get().as_ptr().cast::<f64>(),
                     q_strides: {
                         destruct!([head, seq, _] = q.strides());
                         Strides2D { head, seq }
@@ -119,7 +155,7 @@ impl FlashAttnCfg {
                     s: n + pos,
                 })
             })
-            .collect::<Vec<_>>();
+            .collect::<Box<_>>();
         let cache_pages = stream.from_host(&cache_pages);
         let reqs_ = stream.from_host(&reqs_);
         // 编译
@@ -148,37 +184,4 @@ impl FlashAttnCfg {
                 .memcpy_d2h(c.o.get_mut(), o.get());
         }
     }
-}
-
-fn compile<'ctx>(t_compute: &str, t_data: &str, ctx: &'ctx CurrentCtx) -> Module<'ctx> {
-    const CODE: &str = include_str!("kernel.cuh");
-    let code = format!(
-        r#"{CODE}
-
-extern "C" __global__ void cache_concat(
-    KernelCfg cfg,
-    KVPage<{t_data}> const *cache_pages,
-    KernelReq<{t_data}> const *reqs) {{
-    cache_concat_block(cfg, cache_pages, reqs);
-}}
-
-extern "C" __global__ void flash_attn(
-    KernelCfg cfg,
-    KVPage<{t_data}> const *cache_pages,
-    KernelReq<{t_data}> const *reqs) {{
-    flash_attn_block<{t_compute}>(cfg, cache_pages, reqs);
-}}"#
-    );
-    let cc = ctx.dev().compute_capability();
-    let (ptx, log) = Ptx::compile(code, cc);
-    let ptx = match ptx {
-        Ok(ptx) => {
-            if !log.is_empty() {
-                println!("{log}")
-            }
-            ptx
-        }
-        Err(e) => panic!("{e:?}\n{log}"),
-    };
-    ctx.load(&ptx)
 }

@@ -21,7 +21,7 @@ pub fn online_softmax(data: &mut [f64], block_size: usize) {
 }
 
 #[derive(Clone, Copy)]
-pub struct S {
+pub(crate) struct S {
     pub max: f64,
     pub sum_exp: f64,
 }
@@ -53,7 +53,7 @@ impl S {
 }
 
 #[cfg(test)]
-pub mod test {
+pub(crate) mod test {
     use super::*;
     use std::iter::zip;
 

@@ -158,35 +158,46 @@ __device__ void flash_attn_block(
         }
     }
 }
-// shape (1) (b,kvh)
+// shape (b) (kvh,bn)
 template <typename Tcompute, typename T>
 __device__ void cache_concat_kernel(
     KernelCfg cfg,
     KernelReq<T> const *reqs) {
     size_t const
-        ireq = blockIdx.y,
-        kvh = blockDim.x,
-        head = threadIdx.x;
-    KernelReq const
-        req = reqs[ireq];
+        ireq = blockIdx.x,
+        bn = blockDim.x,
+        ib = threadIdx.x,
+        kvh = blockDim.y,
+        ikv = threadIdx.y;
+
+    KernelReq const req = reqs[ireq];
     size_t const
-        pos = req.s - req.n,
         d = cfg.d;
 
+    // 计算每个线程处理的token数量
+    size_t tokens_per_thread = div_ceil(req.n, bn);
+
+    size_t global_idx = req.s - req.n,
+           start_idx = ib * tokens_per_thread;
     size_t d_size = d * sizeof(T);
-    for (size_t i = 0; i < req.n; ++i) {
-        ptrdiff_t k_offset = req.k_strides.offset(head, i);
-        ptrdiff_t v_offset = req.v_strides.offset(head, i);
 
-        ptrdiff_t c_k_offset = req.kv_strides.offset(head, pos + i);
+    for (size_t i = 0; i < tokens_per_thread; i++) {
+        size_t token_idx = start_idx + i;
+        if (token_idx >= req.n) {
+            break;
+        }
+        // 计算在kv缓存中的绝对位置
+        global_idx += token_idx;
 
-        ptrdiff_t c_v_offset = c_k_offset + req.kv_strides.head * kvh;
+        ptrdiff_t c_offset = req.kv_strides.offset(ikv, global_idx);
+        ptrdiff_t k_offset = req.k_strides.offset(ikv, token_idx);
+        ptrdiff_t v_offset = req.v_strides.offset(ikv, token_idx);
+        ptrdiff_t v_cache_offset = c_offset + req.kv_strides.head * kvh;
 
-        memcpy(byte_offset(req.kv_cache, c_k_offset),
+        memcpy(byte_offset(req.kv_cache, c_offset),
                byte_offset(req.k, k_offset),
                d_size);
-
-        memcpy(byte_offset(req.kv_cache, c_v_offset),
+        memcpy(byte_offset(req.kv_cache, v_cache_offset),
                byte_offset(req.v, v_offset),
                d_size);
     }

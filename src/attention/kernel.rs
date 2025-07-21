@@ -41,7 +41,6 @@ pub(super) struct KernelReq {
     pub v: *const Tdata,
     pub v_strides: Strides2D,
     pub pages_start: usize,
-    pub kv_cache: *mut Tdata,
     pub kv_strides: Strides2D,
     pub o: *mut Tdata,
     pub o_strides: Strides2D,

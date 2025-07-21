@@ -38,7 +38,6 @@ struct KernelReq {
     Strides2D v_strides;
     // kv (paged)
     size_t pages_start;
-    T *kv_cache; //[buf, 2, kvh, d]
     Strides2D kv_strides;
     // output
     T *o;
@@ -49,6 +48,34 @@ struct KernelReq {
     size_t n, s;
 };
 
+// threads (b) (kvh, d)
+template <typename T>
+__device__ void cache_concat_block(
+    KernelCfg cfg,
+    KVPage<T> const *cache_pages,
+    KernelReq<T> const *reqs) {
+    size_t const
+        ireq = blockIdx.x,
+        head = threadIdx.y,
+        it = threadIdx.x;
+
+    KernelReq const req = reqs[ireq];
+    KVPage<T> const *pages = cache_pages + req.pages_start;
+    size_t const
+        bs = cfg.bs,
+        pos = req.s - req.n;
+    for (size_t i = 0; i < req.n; ++i) {
+        size_t const page = (pos + i) / bs;
+        ptrdiff_t const
+            k_offset = req.k_strides.offset(head, i),
+            v_offset = req.v_strides.offset(head, i),
+            c_offset = req.kv_strides.offset(head, (pos + i) % bs);
+        byte_offset(pages[page].k, c_offset)[it] = byte_offset(req.k, k_offset)[it];
+        byte_offset(pages[page].v, c_offset)[it] = byte_offset(req.v, v_offset)[it];
+    }
+}
+
+// threads (b, h) (bn)
 template <typename Tcompute, typename T>
 __device__ void flash_attn_block(
     KernelCfg cfg,
@@ -84,7 +111,6 @@ __device__ void flash_attn_block(
     size_t const
         ikvb_end = div_ceil(req.s, bs),
         iqb_end = div_ceil(req.n, bn);
-
     // ctx 方向迭代
     for (size_t ikvb = 0; ikvb < ikvb_end; ++ikvb) {
         // 每个线程拷贝 k/v 的一行，拷贝整个 kv block 到 local memory
@@ -156,49 +182,5 @@ __device__ void flash_attn_block(
                 o_[j] = (o_[j] * exp + xv) / di;
             }
         }
-    }
-}
-// shape (b) (kvh,bn)
-template <typename Tcompute, typename T>
-__device__ void cache_concat_kernel(
-    KernelCfg cfg,
-    KernelReq<T> const *reqs) {
-    size_t const
-        ireq = blockIdx.x,
-        bn = blockDim.x,
-        ib = threadIdx.x,
-        kvh = blockDim.y,
-        ikv = threadIdx.y;
-
-    KernelReq const req = reqs[ireq];
-    size_t const
-        d = cfg.d;
-
-    // 计算每个线程处理的token数量
-    size_t tokens_per_thread = div_ceil(req.n, bn);
-
-    size_t global_idx = req.s - req.n,
-           start_idx = ib * tokens_per_thread;
-    size_t d_size = d * sizeof(T);
-
-    for (size_t i = 0; i < tokens_per_thread; i++) {
-        size_t token_idx = start_idx + i;
-        if (token_idx >= req.n) {
-            break;
-        }
-        // 计算在kv缓存中的绝对位置
-        global_idx += token_idx;
-
-        ptrdiff_t c_offset = req.kv_strides.offset(ikv, global_idx);
-        ptrdiff_t k_offset = req.k_strides.offset(ikv, token_idx);
-        ptrdiff_t v_offset = req.v_strides.offset(ikv, token_idx);
-        ptrdiff_t v_cache_offset = c_offset + req.kv_strides.head * kvh;
-
-        memcpy(byte_offset(req.kv_cache, c_offset),
-               byte_offset(req.k, k_offset),
-               d_size);
-        memcpy(byte_offset(req.kv_cache, v_cache_offset),
-               byte_offset(req.v, v_offset),
-               d_size);
     }
 }

@@ -88,7 +88,6 @@ impl FlashAttnCfg {
                     v: ptr::null(),
                     v_strides: Strides2D { head: 0, seq: 0 },
                     pages_start,
-                    kv_cache: ptr::null_mut(),
                     kv_strides: {
                         destruct!([seq, _, head, _] = req.cache.strides());
                         Strides2D { head, seq }

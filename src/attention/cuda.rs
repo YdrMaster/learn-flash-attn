@@ -25,9 +25,10 @@ impl FlashAttnCfg {
         // 预备参数
         let &Self {
             h,
+            kvh,
+            d,
             tile_seq,
             tile_ctx,
-            ..
         } = self;
         // 生成发送给 kernel 的配置
         let cfg = self.to_kernel_cfg();
@@ -102,7 +103,6 @@ impl FlashAttnCfg {
                         Strides2D { head, seq }
                     },
                     pages_start,
-                    kv_cache: cache.get().as_ptr().cast_mut().cast(),
                     kv_strides: {
                         destruct!([seq, _, head, _] = cache.strides());
                         Strides2D { head, seq }
@@ -124,34 +124,28 @@ impl FlashAttnCfg {
         let reqs_ = stream.from_host(&reqs_);
         // 编译
         let module = compile("double", "double", stream.ctx());
-        let kernel = module.get_kernel(c"cache_concat");
+        let params = params![cfg, cache_pages.as_ptr(), reqs_.as_ptr()];
+
         stream
             .launch(
-                &kernel,
-                (
-                    reqs.len() as c_uint,
-                    (self.kvh as c_uint, tile_ctx as c_uint),
-                    0,
-                ),
-                &params![cfg, reqs_.as_ptr()].to_ptrs(),
+                &module.get_kernel(c"cache_concat"),
+                (reqs.len() as c_uint, (kvh as c_uint, d as c_uint), 0),
+                &params.to_ptrs(),
             )
-            .synchronize();
+            .launch(
+                &module.get_kernel(c"flash_attn"),
+                (
+                    (reqs.len() as c_uint, h as c_uint),
+                    tile_seq as c_uint,
+                    self.shared_elements() * size_of::<f64>(),
+                ),
+                &params.to_ptrs(),
+            );
 
-        let kernel = module.get_kernel(c"flash_attn");
-
-        stream.launch(
-            &kernel,
-            (
-                (reqs.len() as c_uint, h as c_uint),
-                tile_seq as c_uint,
-                self.shared_elements() * size_of::<f64>(),
-            ),
-            &params![cfg, cache_pages.as_ptr(), reqs_.as_ptr()].to_ptrs(),
-        );
-
-        for (g, c) in zip(reqs_o, reqs) {
-            stream.memcpy_d2h(c.cache.get_mut(), g.4.get());
-            stream.memcpy_d2h(c.o.get_mut(), g.3.get());
+        for ((.., o, cache, _), c) in zip(reqs_o, reqs) {
+            stream
+                .memcpy_d2h(c.cache.get_mut(), cache.get())
+                .memcpy_d2h(c.o.get_mut(), o.get());
         }
     }
 }
@@ -160,19 +154,20 @@ fn compile<'ctx>(t_compute: &str, t_data: &str, ctx: &'ctx CurrentCtx) -> Module
     const CODE: &str = include_str!("kernel.cuh");
     let code = format!(
         r#"{CODE}
+
+extern "C" __global__ void cache_concat(
+    KernelCfg cfg,
+    KVPage<{t_data}> const *cache_pages,
+    KernelReq<{t_data}> const *reqs) {{
+    cache_concat_block(cfg, cache_pages, reqs);
+}}
+
 extern "C" __global__ void flash_attn(
     KernelCfg cfg,
     KVPage<{t_data}> const *cache_pages,
     KernelReq<{t_data}> const *reqs) {{
     flash_attn_block<{t_compute}>(cfg, cache_pages, reqs);
-}}
-
-extern "C" __global__ void cache_concat(
-    KernelCfg cfg,
-    KernelReq<{t_data}> const *reqs) {{
-    cache_concat_kernel<{t_compute}>(cfg, reqs);
-}}
-    "#
+}}"#
     );
     let cc = ctx.dev().compute_capability();
     let (ptx, log) = Ptx::compile(code, cc);

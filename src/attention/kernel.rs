@@ -12,11 +12,11 @@ pub(super) struct KernelCfg {
 #[derive(Clone, Copy, Debug)]
 #[repr(C)]
 pub(super) struct KVPage {
-    pub k: *const Tdata,
-    pub v: *const Tdata,
+    pub k: *mut Tdata,
+    pub v: *mut Tdata,
 }
 
-unsafe impl Send for KVPage {}
+unsafe impl Sync for KVPage {}
 
 #[derive(Clone, Copy, Debug)]
 #[repr(C)]
@@ -50,6 +50,8 @@ pub(super) struct KernelReq {
     pub n: usize,
     pub s: usize,
 }
+
+unsafe impl Sync for KernelReq {}
 
 impl super::FlashAttnCfg {
     pub(super) fn to_kernel_cfg(&self) -> KernelCfg {

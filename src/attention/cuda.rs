@@ -51,8 +51,8 @@ impl FlashAttnCfg {
                         .transform(|layout| layout.index(0, 1))
                         .offset();
                     KVPage {
-                        k: unsafe { base.byte_offset(k).cast() },
-                        v: unsafe { base.byte_offset(v).cast() },
+                        k: unsafe { base.byte_offset(k).cast_mut().cast() },
+                        v: unsafe { base.byte_offset(v).cast_mut().cast() },
                     }
                 })
             })

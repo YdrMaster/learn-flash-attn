@@ -1,23 +1,20 @@
 ﻿use super::{Attention, destruct};
 use crate::attention::{
-    FlashAttnCfg, cache_concat,
+    FlashAttnCfg,
     kernel::{KVPage, KernelCfg, KernelReq, Strides2D},
 };
-use rand::seq::SliceRandom;
+use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use std::{
     iter::zip,
-    ptr::{self, copy_nonoverlapping},
+    ptr::copy_nonoverlapping,
     slice::{from_raw_parts, from_raw_parts_mut},
 };
 
 impl FlashAttnCfg {
     pub fn compute_cpu(&self, reqs: &mut [Attention]) {
-        // 连接 kv cache
-        for req in &mut *reqs {
-            cache_concat(&req.k, &req.v, &mut req.cache, req.pos)
-        }
         let &Self {
             h,
+            kvh,
             tile_seq,
             tile_ctx,
             ..
@@ -27,7 +24,7 @@ impl FlashAttnCfg {
         // 生成所有页指针
         let cache_pages = reqs
             .iter()
-            .flat_map(|req| {
+            .flat_map(|req: &Attention<'_>| {
                 let n = req.q.shape()[1];
                 let pos = req.pos;
                 (0..(pos + n).div_ceil(tile_ctx)).map(|i| {
@@ -45,8 +42,8 @@ impl FlashAttnCfg {
                         .transform(|layout| layout.index(0, 1))
                         .offset();
                     KVPage {
-                        k: unsafe { base.byte_offset(k).cast() },
-                        v: unsafe { base.byte_offset(v).cast() },
+                        k: unsafe { base.byte_offset(k).cast_mut().cast() },
+                        v: unsafe { base.byte_offset(v).cast_mut().cast() },
                     }
                 })
             })
@@ -82,11 +79,16 @@ impl FlashAttnCfg {
                         destruct!([head, seq, _] = req.q.strides());
                         Strides2D { head, seq }
                     },
-                    // kv用于在gpu上进行cache_concat ，cpu上无作用
-                    k: ptr::null(),
-                    k_strides: Strides2D { head: 0, seq: 0 },
-                    v: ptr::null(),
-                    v_strides: Strides2D { head: 0, seq: 0 },
+                    k: req.k.get().as_ptr().cast(),
+                    k_strides: {
+                        destruct!([head, seq, _] = req.k.strides());
+                        Strides2D { head, seq }
+                    },
+                    v: req.v.get().as_ptr().cast(),
+                    v_strides: {
+                        destruct!([head, seq, _] = req.v.strides());
+                        Strides2D { head, seq }
+                    },
                     pages_start,
                     kv_strides: {
                         destruct!([seq, _, head, _] = req.cache.strides());
@@ -105,15 +107,53 @@ impl FlashAttnCfg {
                 })
             })
             .collect::<Vec<_>>();
-        // 生成线程块序号
-        let mut indices = (0..reqs.len())
+        (0..reqs.len())
+            .flat_map(|ireq| (0..kvh).map(move |head| [ireq, head]))
+            .collect::<Vec<_>>()
+            .into_par_iter()
+            .for_each(|[ireq, head]| cache_concat_block(cfg, &cache_pages, &reqs, ireq, head));
+        (0..reqs.len())
             .flat_map(|ireq| (0..h).map(move |head| [ireq, head]))
-            .collect::<Vec<_>>();
-        // 以任意顺序执行
-        indices.shuffle(&mut rand::rng());
-        for [ireq, head] in indices {
-            let mut shared = vec![0.; self.shared_elements()];
-            launch_block(cfg, &cache_pages, &reqs, ireq, head, tile_seq, &mut shared)
+            .collect::<Vec<_>>()
+            .into_par_iter()
+            .for_each(|[ireq, head]| {
+                let mut shared = vec![0.; self.shared_elements()];
+                launch_block(cfg, &cache_pages, &reqs, ireq, head, tile_seq, &mut shared)
+            });
+    }
+}
+
+fn cache_concat_block(
+    cfg: KernelCfg,
+    cache_pages: &[KVPage],
+    reqs: &[KernelReq],
+    ireq: usize,
+    head: usize,
+) {
+    let KernelCfg { d, bs, .. } = cfg;
+    let &KernelReq {
+        k,
+        k_strides,
+        v,
+        v_strides,
+        pages_start,
+        kv_strides,
+        n,
+        s,
+        ..
+    } = &reqs[ireq];
+    let pages = &cache_pages[pages_start..];
+    let pos = s - n;
+    for i in 0..n {
+        let page = pages[(pos + i) / bs];
+        let k_offset = k_strides.offset(head, i);
+        let v_offset = v_strides.offset(head, i);
+        let c_offset = kv_strides.offset(head, (pos + i) % bs);
+        for it in 0..d {
+            unsafe {
+                *page.k.byte_offset(c_offset).add(it) = *k.byte_offset(k_offset).add(it);
+                *page.v.byte_offset(c_offset).add(it) = *v.byte_offset(v_offset).add(it);
+            }
         }
     }
 }

@@ -37,78 +37,9 @@ mod macros {
     pub(super) use destruct;
 }
 
-/// 连接 cache
-fn cache_concat(k: &Tensor<&[u8]>, v: &Tensor<&[u8]>, cache: &mut Tensor<&mut [u8]>, pos: usize) {
-    debug_assert!(matches!(
-        distinct(&[k.dt(), v.dt(), cache.dt()]),
-        Some(any_tensor::digit_layout::types::F64)
-    ));
-
-    destruct!([kvh_k, n_k, d_k] = k.shape());
-    destruct!([kvh_v, n_v, d_v] = v.shape());
-    destruct!([buf, 2, kvh_c, d_c] = cache.shape());
-
-    let kvh = distinct(&[kvh_k, kvh_v, kvh_c]).unwrap();
-    let n = distinct(&[n_k, n_v]).unwrap();
-    let s = pos + n;
-    debug_assert!(distinct(&[d_k, d_v, d_c]).is_some());
-    debug_assert!(buf >= s);
-
-    for i in 0..kvh {
-        let k = k.as_deref().transform(|l| l.index(0, i));
-        let v = v.as_deref().transform(|l| l.index(0, i));
-        let mut cache = cache.as_deref_mut().transform(|l| l.index(2, i));
-
-        for i in 0..n {
-            let mut cache = cache.as_deref_mut().transform(|l| l.index(0, pos + i));
-            let k = array::<f64>(k.as_deref().transform(|l| l.index(0, i)));
-            let v = array::<f64>(v.as_deref().transform(|l| l.index(0, i)));
-            array_mut::<f64>(cache.as_deref_mut().transform(|l| l.index(0, 0))).copy_from_slice(k);
-            array_mut::<f64>(cache.as_deref_mut().transform(|l| l.index(0, 1))).copy_from_slice(v);
-        }
-    }
-}
-
-fn distinct<T: Eq + Copy>(val: &[T]) -> Option<T> {
-    let [ans, tail @ ..] = val else {
-        return None;
-    };
-    if tail.iter().all(|x| x == ans) {
-        Some(*ans)
-    } else {
-        None
-    }
-}
-
-fn array<T: Copy>(tensor: Tensor<&[u8]>) -> &[T] {
-    destruct!([n] = tensor.shape());
-    destruct!([s] = tensor.strides());
-    assert_eq!(tensor.dt().nbytes(), s as usize);
-
-    let offset = tensor.offset() as usize;
-    let data = &tensor.take()[offset..][..n * s as usize];
-    let ([], data, []) = (unsafe { data.align_to::<T>() }) else {
-        unreachable!()
-    };
-    data
-}
-
-fn array_mut<T: Copy>(tensor: Tensor<&mut [u8]>) -> &mut [T] {
-    destruct!([n] = tensor.shape());
-    destruct!([s] = tensor.strides());
-    assert_eq!(tensor.dt().nbytes(), s as usize);
-
-    let offset = tensor.offset() as usize;
-    let data = &mut tensor.take()[offset..][..n * s as usize];
-    let ([], data, []) = (unsafe { data.align_to_mut::<T>() }) else {
-        unreachable!()
-    };
-    data
-}
-
 #[cfg(test)]
 mod test {
-    use super::{Attention, Tensor, array, array_mut, cache_concat, destruct, distinct};
+    use super::{Attention, Tensor, destruct};
     use crate::{FlashAttnCfg, softmax::test::safe_softmax};
     use any_tensor::digit_layout::types;
     use std::iter::zip;
@@ -216,8 +147,43 @@ mod test {
             .collect()
     }
 
-    fn erase_ty_mut<T: Copy>(data: &mut [T]) -> &mut [u8] {
-        unsafe { std::slice::from_raw_parts_mut(data.as_mut_ptr().cast(), size_of_val(data)) }
+    /// 连接 cache
+    fn cache_concat(
+        k: &Tensor<&[u8]>,
+        v: &Tensor<&[u8]>,
+        cache: &mut Tensor<&mut [u8]>,
+        pos: usize,
+    ) {
+        debug_assert!(matches!(
+            distinct(&[k.dt(), v.dt(), cache.dt()]),
+            Some(any_tensor::digit_layout::types::F64)
+        ));
+
+        destruct!([kvh_k, n_k, d_k] = k.shape());
+        destruct!([kvh_v, n_v, d_v] = v.shape());
+        destruct!([buf, 2, kvh_c, d_c] = cache.shape());
+
+        let kvh = distinct(&[kvh_k, kvh_v, kvh_c]).unwrap();
+        let n = distinct(&[n_k, n_v]).unwrap();
+        let s = pos + n;
+        debug_assert!(distinct(&[d_k, d_v, d_c]).is_some());
+        debug_assert!(buf >= s);
+
+        for i in 0..kvh {
+            let k = k.as_deref().transform(|l| l.index(0, i));
+            let v = v.as_deref().transform(|l| l.index(0, i));
+            let mut cache = cache.as_deref_mut().transform(|l| l.index(2, i));
+
+            for i in 0..n {
+                let mut cache = cache.as_deref_mut().transform(|l| l.index(0, pos + i));
+                let k = array::<f64>(k.as_deref().transform(|l| l.index(0, i)));
+                let v = array::<f64>(v.as_deref().transform(|l| l.index(0, i)));
+                array_mut::<f64>(cache.as_deref_mut().transform(|l| l.index(0, 0)))
+                    .copy_from_slice(k);
+                array_mut::<f64>(cache.as_deref_mut().transform(|l| l.index(0, 1)))
+                    .copy_from_slice(v);
+            }
+        }
     }
 
     /// 多头注意力计算
@@ -286,5 +252,46 @@ mod test {
 
     fn erase_ty<T: Copy>(data: &[T]) -> &[u8] {
         unsafe { std::slice::from_raw_parts(data.as_ptr().cast(), size_of_val(data)) }
+    }
+
+    fn erase_ty_mut<T: Copy>(data: &mut [T]) -> &mut [u8] {
+        unsafe { std::slice::from_raw_parts_mut(data.as_mut_ptr().cast(), size_of_val(data)) }
+    }
+
+    fn distinct<T: Eq + Copy>(val: &[T]) -> Option<T> {
+        let [ans, tail @ ..] = val else {
+            return None;
+        };
+        if tail.iter().all(|x| x == ans) {
+            Some(*ans)
+        } else {
+            None
+        }
+    }
+
+    fn array<T: Copy>(tensor: Tensor<&[u8]>) -> &[T] {
+        destruct!([n] = tensor.shape());
+        destruct!([s] = tensor.strides());
+        assert_eq!(tensor.dt().nbytes(), s as usize);
+
+        let offset = tensor.offset() as usize;
+        let data = &tensor.take()[offset..][..n * s as usize];
+        let ([], data, []) = (unsafe { data.align_to::<T>() }) else {
+            unreachable!()
+        };
+        data
+    }
+
+    fn array_mut<T: Copy>(tensor: Tensor<&mut [u8]>) -> &mut [T] {
+        destruct!([n] = tensor.shape());
+        destruct!([s] = tensor.strides());
+        assert_eq!(tensor.dt().nbytes(), s as usize);
+
+        let offset = tensor.offset() as usize;
+        let data = &mut tensor.take()[offset..][..n * s as usize];
+        let ([], data, []) = (unsafe { data.align_to_mut::<T>() }) else {
+            unreachable!()
+        };
+        data
     }
 }

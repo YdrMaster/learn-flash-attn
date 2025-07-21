@@ -65,13 +65,13 @@ __device__ void cache_concat_block(
         bs = cfg.bs,
         pos = req.s - req.n;
     for (size_t i = 0; i < req.n; ++i) {
-        size_t const page = (pos + i) / bs;
+        KVPage const page = pages[(pos + i) / bs];
         ptrdiff_t const
             k_offset = req.k_strides.offset(head, i),
             v_offset = req.v_strides.offset(head, i),
             c_offset = req.kv_strides.offset(head, (pos + i) % bs);
-        byte_offset(pages[page].k, c_offset)[it] = byte_offset(req.k, k_offset)[it];
-        byte_offset(pages[page].v, c_offset)[it] = byte_offset(req.v, v_offset)[it];
+        byte_offset(page.k, c_offset)[it] = byte_offset(req.k, k_offset)[it];
+        byte_offset(page.v, c_offset)[it] = byte_offset(req.v, v_offset)[it];
     }
 }
 

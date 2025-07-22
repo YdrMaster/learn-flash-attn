@@ -1,4 +1,4 @@
-use cuda::{CurrentCtx, Module, Ptx};
+﻿use cuda::{CurrentCtx, Module, Ptx};
 
 pub fn compile<'ctx>(t_compute: &str, t_data: &str, ctx: &'ctx CurrentCtx) -> Module<'ctx> {
     const CODE: &str = include_str!("kernel.cuh");
@@ -167,8 +167,8 @@ impl super::FlashAttnCfg {
                         Strides2D { head, seq }
                     },
                     mask: mem.0.as_ptr().cast(),
-                    l: mem.1.as_ptr().cast_mut().cast(),
-                    m: mem.2.as_ptr().cast_mut().cast(),
+                    // l: mem.1.as_ptr().cast_mut().cast(),
+                    // m: mem.2.as_ptr().cast_mut().cast(),
                     n,
                     s: n + pos,
                 })

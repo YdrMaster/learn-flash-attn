@@ -44,7 +44,6 @@ struct KernelReq {
     Strides2D o_strides;
     // config
     bool *const mask;
-    T *l, *m;
     size_t n, s;
 };
 

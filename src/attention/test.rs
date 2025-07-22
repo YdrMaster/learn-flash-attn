@@ -110,33 +110,33 @@ fn test_flash_attention() {
             )
         }
     }
-    // #[cfg(cuda)]
-    // {
-    //     let mut res = vec![0.; H * N * D];
-    //     let mut cache_res = cache_data.clone();
-    //     let mut reqs = [Attention {
-    //         q: q.clone(),
-    //         k: k.clone(),
-    //         v: v.clone(),
-    //         o: o.as_ref().map(|_| erase_ty_mut(&mut res)),
-    //         cache: cache.as_ref().map(|_| erase_ty_mut(&mut cache_res)),
-    //         pos: P,
-    //     }];
+    #[cfg(cuda)]
+    {
+        let mut res = vec![0.; H * N * D];
+        let mut cache_res = cache_data.clone();
+        let mut reqs = [Attention {
+            q: q.clone(),
+            k: k.clone(),
+            v: v.clone(),
+            o: o.as_ref().map(|_| erase_ty_mut(&mut res)),
+            cache: cache.as_ref().map(|_| erase_ty_mut(&mut cache_res)),
+            pos: P,
+        }];
 
-    //     cuda::init().unwrap();
-    //     cuda::Device::new(0)
-    //         .context()
-    //         .apply(move |ctx| FLASH_ATTN.test_compute_cuda(&mut reqs, &ctx.stream()));
+        cuda::init().unwrap();
+        cuda::Device::new(0)
+            .context()
+            .apply(move |ctx| FLASH_ATTN.test_compute_cuda(&mut reqs, &ctx.stream()));
 
-    //     for (ans, res) in zip(ans.clone(), res).chain(zip(cache_ans.clone(), cache_res)) {
-    //         let e_abs = (ans - res).abs();
-    //         assert!(
-    //             e_abs < 1e3 * Tdata::EPSILON,
-    //             "err = {e_abs:.3e} {}x",
-    //             e_abs / Tdata::EPSILON
-    //         )
-    //     }
-    // }
+        for (ans, res) in zip(ans.clone(), res).chain(zip(cache_ans.clone(), cache_res)) {
+            let e_abs = (ans - res).abs();
+            assert!(
+                e_abs < 1e3 * Tdata::EPSILON,
+                "err = {e_abs:.3e} {}x",
+                e_abs / Tdata::EPSILON
+            )
+        }
+    }
 }
 
 fn random_data<T: Float + FromPrimitive>(n: usize) -> Vec<T> {

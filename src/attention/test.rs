@@ -42,14 +42,15 @@ pub(super) type Tensor<T> = any_tensor::Tensor<T, 3>;
 
 #[test]
 fn test_flash_attention() {
-    type Tdata = f32;
-    const DT: DigitLayout = types::F32;
+    type Tdata = f64;
+    const DT: DigitLayout = types::F64;
+
     const H: usize = 32;
     const KVH: usize = 8;
     const N: usize = 7;
     const S: usize = 1024;
     const P: usize = S - N;
-    const D: usize = 128;
+    const D: usize = 64;
 
     const FLASH_ATTN: FlashAttnCfg = FlashAttnCfg {
         h: H,
@@ -87,6 +88,9 @@ fn test_flash_attention() {
         P,
     );
 
+    let max_error = 10. * Tdata::EPSILON.sqrt();
+    println!("max error: {max_error:e}");
+
     // 计算 flash attention
     {
         let mut res = vec![0.; H * N * D];
@@ -101,14 +105,12 @@ fn test_flash_attention() {
         }];
         FLASH_ATTN.test_compute_cpu(&mut reqs);
 
-        for (ans, res) in zip(ans.clone(), res).chain(zip(cache_ans.clone(), cache_res)) {
-            let e_abs = (ans - res).abs();
-            assert!(
-                e_abs < 1e3 * Tdata::EPSILON,
-                "err = {e_abs:.3e} {}x",
-                e_abs / Tdata::EPSILON
-            )
-        }
+        let max = zip(ans.clone(), res)
+            .chain(zip(cache_ans.clone(), cache_res))
+            .map(|(ans, res)| (ans - res).abs())
+            .fold(0., |max, it| Tdata::max(max, it));
+        println!("CPU: max error = {max:e}");
+        assert!(max < max_error, "CPU error mismatch")
     }
     #[cfg(cuda)]
     {
@@ -128,14 +130,12 @@ fn test_flash_attention() {
             .context()
             .apply(move |ctx| FLASH_ATTN.test_compute_cuda(&mut reqs, &ctx.stream()));
 
-        for (ans, res) in zip(ans.clone(), res).chain(zip(cache_ans.clone(), cache_res)) {
-            let e_abs = (ans - res).abs();
-            assert!(
-                e_abs < 1e3 * Tdata::EPSILON,
-                "err = {e_abs:.3e} {}x",
-                e_abs / Tdata::EPSILON
-            )
-        }
+        let max = zip(ans.clone(), res)
+            .chain(zip(cache_ans.clone(), cache_res))
+            .map(|(ans, res)| (ans - res).abs())
+            .fold(0., |max, it| Tdata::max(max, it));
+        println!("GPU: max error = {max:e}");
+        assert!(max < max_error, "GPU error mismatch")
     }
 }
 

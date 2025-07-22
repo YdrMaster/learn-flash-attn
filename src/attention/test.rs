@@ -108,7 +108,7 @@ fn test_flash_attention() {
         let max = zip(ans.clone(), res)
             .chain(zip(cache_ans.clone(), cache_res))
             .map(|(ans, res)| (ans - res).abs())
-            .fold(0., |max, it| Tdata::max(max, it));
+            .fold(0., Tdata::max);
         println!("CPU: max error = {max:e}");
         assert!(max < max_error, "CPU error mismatch")
     }
@@ -133,7 +133,7 @@ fn test_flash_attention() {
         let max = zip(ans.clone(), res)
             .chain(zip(cache_ans.clone(), cache_res))
             .map(|(ans, res)| (ans - res).abs())
-            .fold(0., |max, it| Tdata::max(max, it));
+            .fold(0., Tdata::max);
         println!("GPU: max error = {max:e}");
         assert!(max < max_error, "GPU error mismatch")
     }

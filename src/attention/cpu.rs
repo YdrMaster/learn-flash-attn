@@ -245,10 +245,9 @@ impl super::FlashAttnCfg {
                 let s = pos + n;
                 let s_ceil = s.div_ceil(tile_ctx) * tile_ctx;
                 // 注意力掩码
-                let mask = (0..n * s_ceil)
+                (0..n * s_ceil)
                     .map(|i| i % s_ceil <= s - n + i / s_ceil)
-                    .collect::<Box<_>>();
-                mask
+                    .collect::<Box<_>>()
             })
             .collect::<Box<_>>();
         // 为每个请求的每个头生成 block

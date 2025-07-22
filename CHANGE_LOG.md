@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.12] - 2025-07-22
+
+### Changed
+
+- 更新为 flash attention2；
+
 ## [0.0.11] - 2025-07-21
 
 ### Changed
@@ -88,7 +94,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - 创建项目；
 - 实现基本的 online softmax；
 
-[Unreleased]: https://github.com/YdrMaster/learn-flash-attn/compare/v0.0.11...HEAD
+[Unreleased]: https://github.com/YdrMaster/learn-flash-attn/compare/v0.0.12...HEAD
+[0.0.12]: https://github.com/YdrMaster/learn-flash-attn/compare/v0.0.11...v0.0.12
 [0.0.11]: https://github.com/YdrMaster/learn-flash-attn/compare/v0.0.10...v0.0.11
 [0.0.10]: https://github.com/YdrMaster/learn-flash-attn/compare/v0.0.9...v0.0.10
 [0.0.9]: https://github.com/YdrMaster/learn-flash-attn/compare/v0.0.8...v0.0.9

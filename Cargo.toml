@@ -1,8 +1,12 @@
 [package]
 name = "learn-flash-attn"
-version = "0.0.11"
+version = "0.0.12"
 edition = "2024"
-authors = ["YdrMaster <ydrml@hotmail.com>"]
+authors = [
+    "YdrMaster <ydrml@hotmail.com>",
+    "pwhMass <a203865235@gmail.com>",
+    "onenewcode <lovestudy@qq.com>",
+]
 
 [dependencies]
 any-tensor = "0.0"

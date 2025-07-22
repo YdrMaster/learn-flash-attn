@@ -57,10 +57,9 @@ pub struct KernelReq<T> {
     pub o: *mut T,
     pub o_strides: Strides2D,
     pub mask: *const bool,
-    pub l: *mut T,
-    pub m: *mut T,
     pub n: usize,
     pub s: usize,
+    pub s_ceil: usize,
 }
 
 unsafe impl<T: Copy> Sync for KernelReq<T> {}
@@ -90,7 +89,8 @@ impl FlashAttnCfg {
             tile_ctx,
             ..
         } = self;
-        tile_seq * d + tile_ctx * d + tile_ctx * d + tile_seq * tile_ctx
+        // qi oi kj vj x
+        tile_seq * d + tile_seq * d + tile_ctx * d + tile_ctx * d + tile_seq * tile_ctx
     }
 }
 

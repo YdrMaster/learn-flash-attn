@@ -1,4 +1,4 @@
-use cuda::{CurrentCtx, Module, Ptx};
+﻿use cuda::{CurrentCtx, Module, Ptx};
 
 pub fn compile<'ctx>(t_compute: &str, t_data: &str, ctx: &'ctx CurrentCtx) -> Module<'ctx> {
     const CODE: &str = include_str!("kernel.cuh");
@@ -117,19 +117,12 @@ impl super::FlashAttnCfg {
             .map(|(q, _, _, _, _, pos)| {
                 let n = q.shape()[1];
                 let s = pos + n;
+                let s_ceil = s.div_ceil(tile_ctx) * tile_ctx;
                 // 注意力掩码
-                let mask = (0..n * s)
-                    .map(|i| i % s <= s - n + i / s)
+                let mask = (0..n * s_ceil)
+                    .map(|i| i % s_ceil <= s - n + i / s_ceil)
                     .collect::<Box<_>>();
-                // 注意力分母
-                let l = vec![0.; h * s];
-                // 最大值缓存
-                let m = vec![T::neg_infinity(); h * s];
-                (
-                    stream.from_host(&mask),
-                    stream.from_host(&l),
-                    stream.from_host(&m),
-                )
+                stream.from_host(&mask)
             })
             .collect::<Box<_>>();
         // 为每个请求的每个头生成 block
@@ -166,11 +159,10 @@ impl super::FlashAttnCfg {
                         destruct!([head, seq, _] = o.strides());
                         Strides2D { head, seq }
                     },
-                    mask: mem.0.as_ptr().cast(),
-                    l: mem.1.as_ptr().cast_mut().cast(),
-                    m: mem.2.as_ptr().cast_mut().cast(),
+                    mask: mem.as_ptr().cast(),
                     n,
                     s: n + pos,
+                    s_ceil: (n + pos).div_ceil(tile_ctx) * tile_ctx,
                 })
             })
             .collect::<Box<_>>();

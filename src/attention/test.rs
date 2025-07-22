@@ -48,7 +48,7 @@ fn test_flash_attention() {
     const H: usize = 32;
     const KVH: usize = 8;
     const N: usize = 7;
-    const S: usize = 1024;
+    const S: usize = 1000;
     const P: usize = S - N;
     const D: usize = 64;
 

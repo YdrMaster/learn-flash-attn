@@ -1,4 +1,19 @@
 #include <cuda/std/cstddef>
+#include <cuda_fp16.h>
+#include <cuda_runtime.h>
+
+template <typename T>
+__host__ __device__ T neg_inf();
+
+template <>
+__host__ __device__ float neg_inf<float>() {
+    return __int_as_float(0xFF800000);
+}
+
+template <>
+__host__ __device__ double neg_inf<double>() {
+    return __longlong_as_double(0xFFF0000000000000ULL);
+}
 
 __device__ size_t div_ceil(size_t a, size_t b) {
     return (a + b - 1) / b;
@@ -44,8 +59,7 @@ struct KernelReq {
     Strides2D o_strides;
     // config
     bool *const mask;
-    T *l, *m;
-    size_t n, s;
+    size_t n, s, s_ceil;
 };
 
 // threads (b) (kvh, d)
@@ -98,88 +112,106 @@ __device__ void flash_attn_block(
     // 划分 shared memory
     extern __shared__ T shared[];
     T *qi = shared,
-      *kj = qi + bn * d,
+      *oi = qi + bn * d,
+      *kj = oi + bn * d,
       *vj = kj + bs * d,
       *x = vj + bs * d;
-    // 定位每个线程块的 m 和 l，长度 s
-    T *m = req.m + head * req.s,
-      *l = req.l + head * req.s;
-    // 定位每个线程的 qi 和 x
-    qi += it * d; // 长度 d
-    x += it * bs; // 长度 bs
+    // 定位每个线程的 qi, oi, x
+    qi += it * d;
+    oi += it * d;
+    x += it * bs;
 
     size_t const
         ikvb_end = div_ceil(req.s, bs),
         iqb_end = div_ceil(req.n, bn);
-    // ctx 方向迭代
-    for (size_t ikvb = 0; ikvb < ikvb_end; ++ikvb) {
-        // 每个线程拷贝 k/v 的一行，拷贝整个 kv block 到 local memory
-        {
-            T const
-                *k = (cache_pages + req.pages_start + ikvb)->k,
-                *v = (cache_pages + req.pages_start + ikvb)->v;
-            for (size_t i = it; i < bs; i += bn) {
-                ptrdiff_t const offset = req.kv_strides.offset(head / g, i);
-                memcpy(kj + i * d, byte_offset(k, offset), d * sizeof(T));
-                memcpy(vj + i * d, byte_offset(v, offset), d * sizeof(T));
-            }
-        }
-        __syncthreads();
-        // seq 方向迭代
-        for (size_t iqb = 0; iqb < iqb_end; ++iqb) {
-            // 每个线程计算 q 的一行
-            size_t iq = iqb * bn + it;
-            if (iq >= req.n) {
-                break;
-            }
+    // seq 方向迭代
+    for (size_t iqb = 0; iqb < iqb_end; ++iqb) {
+        // 每个线程计算 q 的一行
+        size_t iq = iqb * bn + it;
+
+        T const *q_;
+        if (iq < req.n) {
             // locate data
-            T const *q_ = byte_offset(req.q, req.q_strides.offset(head, iq));
-            T /***/ *o_ = byte_offset(req.o, req.o_strides.offset(head, iq));
+            q_ = byte_offset(req.q, req.q_strides.offset(head, iq));
             // load data
             memcpy(qi, q_, d * sizeof(T));
-            bool const *mask = req.mask + iq * req.s + ikvb * bs;
 
-            Tcompute const mi_1 = m[iq],
-                           di_1 = l[iq];
-
-            // score = q @ k^T / √d
-            Tcompute mi = mi_1;
-            for (size_t i = 0; i < bs; ++i) {
-                if (mask[i]) {
-                    Tcompute qk = 0;
-                    for (size_t j = 0; j < d; ++j) {
-                        qk += qi[j] * kj[i * d + j];
-                    }
-                    qk *= scale;
-                    x[i] = qk;
-                    if (qk > mi) {
-                        mi = qk;
-                    }
-                }
-            }
-
-            Tcompute sum = 0;
-            for (size_t i = 0; i < bs; ++i) {
-                if (!mask[i]) {
-                    x[i] = 0;
-                } else {
-                    x[i] = ::exp(x[i] - mi);
-                    sum += x[i];
-                }
-            }
-
-            Tcompute exp = di_1 * ::exp(mi_1 - mi),
-                     di = exp + sum;
-            // 更新 m, l
-            m[iq] = mi;
-            l[iq] = di;
-
+            // 初始化oi
             for (size_t j = 0; j < d; ++j) {
-                Tcompute xv = 0;
-                for (size_t i = 0; i < bs; ++i) {
-                    xv += x[i] * vj[i * d + j];
+                oi[j] = 0;
+            }
+        }
+
+        // 初始化m l
+        Tcompute mi_1 = neg_inf<Tcompute>(),
+                 di_1 = 0.0;
+        // ctx 方向迭代
+        for (size_t ikvb = 0; ikvb < ikvb_end; ++ikvb) {
+
+            // TODO 这里是否需要同步？
+            __syncthreads();
+            // 每个线程拷贝 k/v 的一行，拷贝整个 kv block 到 local memory
+            {
+                T const
+                    *k = (cache_pages + req.pages_start + ikvb)->k,
+                    *v = (cache_pages + req.pages_start + ikvb)->v;
+                for (size_t i = it; i < bs; i += bn) {
+                    ptrdiff_t const offset = req.kv_strides.offset(head / g, i);
+                    memcpy(kj + i * d, byte_offset(k, offset), d * sizeof(T));
+                    memcpy(vj + i * d, byte_offset(v, offset), d * sizeof(T));
                 }
-                o_[j] = (o_[j] * exp + xv) / di;
+            }
+            __syncthreads();
+
+            if (iq < req.n) {
+                bool const *mask = req.mask + iq * req.s_ceil + ikvb * bs;
+
+                // score = q @ k^T / √d
+                Tcompute mi = mi_1;
+                for (size_t i = 0; i < bs; ++i) {
+                    if (mask[i]) {
+                        Tcompute qk = 0;
+                        for (size_t j = 0; j < d; ++j) {
+                            qk += qi[j] * kj[i * d + j];
+                        }
+                        qk *= scale;
+                        x[i] = qk;
+                        if (qk > mi) {
+                            mi = qk;
+                        }
+                    }
+                }
+
+                Tcompute sum = 0;
+                for (size_t i = 0; i < bs; ++i) {
+                    if (!mask[i]) {
+                        x[i] = 0;
+                    } else {
+                        x[i] = ::exp(x[i] - mi);
+                        sum += x[i];
+                    }
+                }
+
+                Tcompute exp = ::exp(mi_1 - mi),
+                         exp_mut_di_1 = di_1 * exp,
+                         di = exp_mut_di_1 + sum;
+                // 更新 m, l
+                mi_1 = mi;
+                di_1 = di;
+
+                for (size_t j = 0; j < d; ++j) {
+                    Tcompute xv = 0;
+                    for (size_t i = 0; i < bs; ++i) {
+                        xv += x[i] * vj[i * d + j];
+                    }
+                    oi[j] = oi[j] * exp + xv;
+                }
+            }
+        }
+        if (iq < req.n) {
+            T *o = byte_offset(req.o, req.o_strides.offset(head, iq));
+            for (size_t i = 0; i < d; ++i) {
+                o[i] = oi[i] / di_1;
             }
         }
     }

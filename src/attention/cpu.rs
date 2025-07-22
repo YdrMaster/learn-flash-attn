@@ -62,10 +62,10 @@ pub fn flash_attn_block<T: Float + FromPrimitive + AddAssign + Sum<T>>(
         o_strides,
         mask,
         n,
-        s,
+        s_ceil,
         ..
     } = &reqs[ireq];
-    let pages = &cache_pages[pages_start..][..s.div_ceil(bs)];
+    let pages = &cache_pages[pages_start..][..s_ceil.div_ceil(bs)];
     // 划分 shared memory
     let (qi, shared) = shared.split_at_mut(bn * d);
     let (oi_, shared) = shared.split_at_mut(bn * d);
@@ -114,7 +114,7 @@ pub fn flash_attn_block<T: Float + FromPrimitive + AddAssign + Sum<T>>(
                     break;
                 }
 
-                let mask = unsafe { from_raw_parts(mask.add(iq * s + ikvb * bs), bs) };
+                let mask = unsafe { from_raw_parts(mask.add(iq * s_ceil + ikvb * bs), bs) };
 
                 // 初始化 mi_1, di_1
                 let mi_1 = &mut mi_1_array[it];
@@ -243,9 +243,10 @@ impl super::FlashAttnCfg {
                 let n = req.q.shape()[1];
                 let pos = req.pos;
                 let s = pos + n;
+                let s_ceil = s.div_ceil(tile_ctx) * tile_ctx;
                 // 注意力掩码
-                let mask = (0..n * s)
-                    .map(|i| i % s <= s - n + i / s)
+                let mask = (0..n * s_ceil)
+                    .map(|i| i % s_ceil <= s - n + i / s_ceil)
                     .collect::<Box<_>>();
                 mask
             })
@@ -285,7 +286,8 @@ impl super::FlashAttnCfg {
                     },
                     mask: mem.as_ptr(),
                     n,
-                    s: n + req.pos,
+                    s: req.pos + n,
+                    s_ceil: (req.pos + n).div_ceil(tile_ctx) * tile_ctx,
                 })
             })
             .collect::<Box<_>>();

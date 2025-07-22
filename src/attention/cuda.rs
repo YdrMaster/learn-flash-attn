@@ -117,9 +117,10 @@ impl super::FlashAttnCfg {
             .map(|(q, _, _, _, _, pos)| {
                 let n = q.shape()[1];
                 let s = pos + n;
+                let s_ceil = s.div_ceil(tile_ctx) * tile_ctx;
                 // 注意力掩码
-                let mask = (0..n * s)
-                    .map(|i| i % s <= s - n + i / s)
+                let mask = (0..n * s_ceil)
+                    .map(|i| i % s_ceil <= s - n + i / s_ceil)
                     .collect::<Box<_>>();
                 stream.from_host(&mask)
             })
@@ -161,6 +162,7 @@ impl super::FlashAttnCfg {
                     mask: mem.as_ptr().cast(),
                     n,
                     s: n + pos,
+                    s_ceil: (n + pos).div_ceil(tile_ctx) * tile_ctx,
                 })
             })
             .collect::<Box<_>>();

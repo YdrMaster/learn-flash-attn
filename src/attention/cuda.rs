@@ -1,4 +1,51 @@
-﻿use cuda::{CurrentCtx, Module, Ptx};
+﻿use crate::attention::{KVPage, KernelReq};
+use cuda::{CurrentCtx, Module, Ptx, Stream, params};
+use std::ffi::c_uint;
+
+impl super::FlashAttnCfg {
+    pub fn compute_cuda<T: Copy>(
+        &self,
+        cache_pages: &[KVPage<T>],
+        reqs: &[KernelReq<T>],
+        t_compute: &str,
+        t_data: &str,
+        stream: &Stream,
+    ) {
+        let &Self {
+            h,
+            kvh,
+            d,
+            tile_seq,
+            ..
+        } = self;
+        // 拷贝参数
+        let cache_pages = stream.from_host(cache_pages);
+        let reqs_ = stream.from_host(reqs);
+        // 生成发送给 kernel 的配置
+        let cfg = self.to_kernel_cfg();
+        // 编译
+        let module = compile(t_compute, t_data, stream.ctx());
+        let params = params![cfg, cache_pages.as_ptr(), reqs_.as_ptr()];
+        // 发射 kernel
+        stream
+            .launch(
+                &module.get_kernel(c"cache_concat"),
+                (reqs.len() as c_uint, (kvh as c_uint, d as c_uint), 0),
+                &params.to_ptrs(),
+            )
+            .launch(
+                &module.get_kernel(c"flash_attn"),
+                (
+                    (reqs.len() as c_uint, h as c_uint),
+                    tile_seq as c_uint,
+                    self.shared_elements() * size_of::<T>(),
+                ),
+                &params.to_ptrs(),
+            )
+            .free(reqs_)
+            .free(cache_pages);
+    }
+}
 
 pub fn compile<'ctx>(t_compute: &str, t_data: &str, ctx: &'ctx CurrentCtx) -> Module<'ctx> {
     const CODE: &str = include_str!("kernel.cuh");
@@ -59,8 +106,7 @@ impl super::FlashAttnCfg {
         stream: &cuda::Stream,
     ) {
         use super::{KVPage, KernelReq, Strides2D, test::destruct};
-        use cuda::params;
-        use std::{ffi::c_uint, iter::zip};
+        use std::iter::zip;
 
         // 生成 GPU 版本
         let reqs_o = reqs
@@ -76,16 +122,8 @@ impl super::FlashAttnCfg {
                 )
             })
             .collect::<Box<_>>();
-        // 预备参数
-        let &Self {
-            h,
-            kvh,
-            d,
-            tile_seq,
-            tile_ctx,
-        } = self;
-        // 生成发送给 kernel 的配置
-        let cfg = self.to_kernel_cfg();
+
+        let &Self { tile_ctx, .. } = self;
         // 生成所有页指针
         let cache_pages = reqs_o
             .iter()
@@ -166,27 +204,8 @@ impl super::FlashAttnCfg {
                 })
             })
             .collect::<Box<_>>();
-        let cache_pages = stream.from_host(&cache_pages);
-        let reqs_ = stream.from_host(&reqs_);
-        // 编译
-        let module = compile(t_compute, t_data, stream.ctx());
-        let params = params![cfg, cache_pages.as_ptr(), reqs_.as_ptr()];
 
-        stream
-            .launch(
-                &module.get_kernel(c"cache_concat"),
-                (reqs.len() as c_uint, (kvh as c_uint, d as c_uint), 0),
-                &params.to_ptrs(),
-            )
-            .launch(
-                &module.get_kernel(c"flash_attn"),
-                (
-                    (reqs.len() as c_uint, h as c_uint),
-                    tile_seq as c_uint,
-                    self.shared_elements() * size_of::<T>(),
-                ),
-                &params.to_ptrs(),
-            );
+        self.compute_cuda::<T>(&cache_pages, &reqs_, t_compute, t_data, stream);
 
         for ((.., o, cache, _), c) in zip(reqs_o, reqs) {
             stream

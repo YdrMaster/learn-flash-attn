@@ -7,7 +7,35 @@ use std::{
     slice::{from_raw_parts, from_raw_parts_mut},
 };
 
-pub fn cache_concat_block<T: Copy>(
+impl super::FlashAttnCfg {
+    pub fn compute_cpu<T>(&self, cache_pages: &[KVPage<T>], reqs: &[KernelReq<T>])
+    where
+        T: Float + FromPrimitive + AddAssign + Sum<T>,
+    {
+        use rayon::iter::{IntoParallelIterator, ParallelIterator};
+        let &Self {
+            h, kvh, tile_seq, ..
+        } = self;
+        // 生成发送给 kernel 的配置
+        let cfg = self.to_kernel_cfg();
+        // 发射 kernel
+        (0..reqs.len())
+            .flat_map(|ireq| (0..kvh).map(move |head| [ireq, head]))
+            .collect::<Box<_>>()
+            .into_par_iter()
+            .for_each(|&[ireq, head]| cache_concat_block(cfg, &cache_pages, &reqs, ireq, head));
+        (0..reqs.len())
+            .flat_map(|ireq| (0..h).map(move |head| [ireq, head]))
+            .collect::<Box<_>>()
+            .into_par_iter()
+            .for_each(|&[ireq, head]| {
+                let mut shared = vec![T::zero(); self.shared_elements()];
+                flash_attn_block(cfg, &cache_pages, &reqs, ireq, head, tile_seq, &mut shared)
+            })
+    }
+}
+
+fn cache_concat_block<T: Copy>(
     cfg: KernelCfg,
     cache_pages: &[KVPage<T>],
     reqs: &[KernelReq<T>],
@@ -42,7 +70,7 @@ pub fn cache_concat_block<T: Copy>(
     }
 }
 
-pub fn flash_attn_block<T: Float + FromPrimitive + AddAssign + Sum<T>>(
+fn flash_attn_block<T: Float + FromPrimitive + AddAssign + Sum<T>>(
     cfg: KernelCfg,
     cache_pages: &[KVPage<T>],
     reqs: &[KernelReq<T>],
@@ -200,17 +228,8 @@ impl super::FlashAttnCfg {
             Strides2D,
             test::{Attention, destruct},
         };
-        use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
-        let &Self {
-            h,
-            kvh,
-            tile_seq,
-            tile_ctx,
-            ..
-        } = self;
-        // 生成发送给 kernel 的配置
-        let cfg = self.to_kernel_cfg();
+        let &Self { tile_ctx, .. } = self;
         // 生成所有页指针
         let cache_pages = reqs
             .iter()
@@ -292,18 +311,7 @@ impl super::FlashAttnCfg {
                 })
             })
             .collect::<Box<_>>();
-        (0..reqs.len())
-            .flat_map(|ireq| (0..kvh).map(move |head| [ireq, head]))
-            .collect::<Box<_>>()
-            .into_par_iter()
-            .for_each(|&[ireq, head]| cache_concat_block(cfg, &cache_pages, &reqs, ireq, head));
-        (0..reqs.len())
-            .flat_map(|ireq| (0..h).map(move |head| [ireq, head]))
-            .collect::<Box<_>>()
-            .into_par_iter()
-            .for_each(|&[ireq, head]| {
-                let mut shared = vec![T::zero(); self.shared_elements()];
-                flash_attn_block(cfg, &cache_pages, &reqs, ireq, head, tile_seq, &mut shared)
-            });
+
+        self.compute_cpu::<T>(&cache_pages, &reqs)
     }
 }

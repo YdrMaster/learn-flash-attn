@@ -1,5 +1,5 @@
 ﻿use super::FlashAttnCfg;
-use crate::softmax::test::safe_softmax;
+use crate::{attention::Strides2D, softmax::test::safe_softmax};
 use any_tensor::digit_layout::{DigitLayout, types};
 use num_traits::{Float, FromPrimitive};
 use std::{
@@ -7,19 +7,15 @@ use std::{
     ops::{AddAssign, DivAssign},
 };
 
-pub(super) use macros::destruct;
-
-mod macros {
-    macro_rules! destruct {
-        ($pat:pat = $slice:expr) => {
-            let &$pat = &*$slice else {
-                panic!("Ndim mismatch ( = {})", $slice.len())
-            };
+macro_rules! destruct {
+    ($pat:pat = $slice:expr) => {
+        let &$pat = &*$slice else {
+            panic!("Ndim mismatch ( = {})", $slice.len())
         };
-    }
-    pub(crate) use destruct;
+    };
 }
 
+pub(super) type Tensor<T> = any_tensor::Tensor<T, 3>;
 pub(super) struct Attention<'a> {
     pub q: Tensor<&'a [u8]>,
     pub k: Tensor<&'a [u8]>,
@@ -38,7 +34,12 @@ impl Attention<'_> {
     }
 }
 
-pub(super) type Tensor<T> = any_tensor::Tensor<T, 3>;
+impl Strides2D {
+    pub fn from_tensor<T>(tensor: &Tensor<T>) -> Self {
+        destruct!([head, seq, _] = tensor.strides());
+        Strides2D { head, seq }
+    }
+}
 
 #[test]
 fn test_flash_attention() {

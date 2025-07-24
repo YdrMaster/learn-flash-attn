@@ -7,8 +7,7 @@ impl super::FlashAttnCfg {
         &self,
         cache_pages: &[KVPage<T>],
         reqs: &[KernelReq<T>],
-        t_compute: &str,
-        t_data: &str,
+        module: &Module,
         stream: &Stream,
     ) {
         let &Self {
@@ -21,12 +20,8 @@ impl super::FlashAttnCfg {
         // 拷贝参数
         let cache_pages = stream.from_host(cache_pages);
         let reqs_ = stream.from_host(reqs);
-        // 生成发送给 kernel 的配置
-        let cfg = self.to_kernel_cfg();
-        // 编译
-        let module = compile(t_compute, t_data, stream.ctx());
-        let params = params![cfg, cache_pages.as_ptr(), reqs_.as_ptr()];
         // 发射 kernel
+        let params = params![self.to_kernel_cfg(), cache_pages.as_ptr(), reqs_.as_ptr()];
         stream
             .launch(
                 &module.get_kernel(c"cache_concat"),
@@ -105,7 +100,7 @@ impl super::FlashAttnCfg {
         t_data: &str,
         stream: &cuda::Stream,
     ) {
-        use super::{KVPage, KernelReq, Strides2D, test::destruct};
+        use super::{KVPage, KernelReq, Strides2D};
         use std::iter::zip;
 
         // 生成 GPU 版本
@@ -149,8 +144,8 @@ impl super::FlashAttnCfg {
                 })
             })
             .collect::<Box<_>>();
-        // 生成 workspace
-        let req_memory = reqs_o
+        // 生成 mask
+        let masks = reqs_o
             .iter()
             .map(|(q, _, _, _, _, pos)| {
                 let n = q.shape()[1];
@@ -166,46 +161,34 @@ impl super::FlashAttnCfg {
         // 为每个请求的每个头生成 block
         let reqs_ = reqs_o
             .iter()
-            .zip(&req_memory)
+            .zip(&masks)
             .scan(0, |start, ((q, k, v, o, cache, pos), mem)| {
                 let pages_start = *start as _;
                 let n = q.shape()[1];
                 Some(KernelReq::<T> {
                     q: q.get().as_ptr().cast(),
-                    q_strides: {
-                        destruct!([head, seq, _] = q.strides());
-                        Strides2D { head, seq }
-                    },
-
+                    q_strides: Strides2D::from_tensor(q),
                     k: k.get().as_ptr().cast(),
-                    k_strides: {
-                        destruct!([head, seq, _] = k.strides());
-                        Strides2D { head, seq }
-                    },
+                    k_strides: Strides2D::from_tensor(k),
                     v: v.get().as_ptr().cast(),
-                    v_strides: {
-                        destruct!([head, seq, _] = v.strides());
-                        Strides2D { head, seq }
-                    },
+                    v_strides: Strides2D::from_tensor(v),
                     pages_start,
-                    kv_strides: {
-                        destruct!([seq, _, head, _] = cache.strides());
-                        Strides2D { head, seq }
-                    },
+                    kv_strides: Strides2D::from_tensor(
+                        &cache
+                            .as_ref()
+                            .transform(|layout| layout.index(1, 0).transpose(&[1, 0])),
+                    ),
                     o: o.get().as_ptr().cast_mut().cast(),
-                    o_strides: {
-                        destruct!([head, seq, _] = o.strides());
-                        Strides2D { head, seq }
-                    },
+                    o_strides: Strides2D::from_tensor(o),
                     mask: mem.as_ptr().cast(),
                     n,
                     s: n + pos,
-                    s_ceil: (n + pos).div_ceil(tile_ctx) * tile_ctx,
                 })
             })
             .collect::<Box<_>>();
-
-        self.compute_cuda::<T>(&cache_pages, &reqs_, t_compute, t_data, stream);
+        // 编译及计算
+        let module = compile(t_compute, t_data, stream.ctx());
+        self.compute_cuda::<T>(&cache_pages, &reqs_, &module, stream);
 
         for ((.., o, cache, _), c) in zip(reqs_o, reqs) {
             stream

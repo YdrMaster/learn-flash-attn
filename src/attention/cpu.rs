@@ -1,5 +1,6 @@
 ﻿use crate::attention::{KVPage, KernelCfg, KernelReq};
 use num_traits::{Float, FromPrimitive};
+use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use std::{
     iter::{Sum, zip},
     ops::AddAssign,
@@ -12,27 +13,26 @@ impl super::FlashAttnCfg {
     where
         T: Float + FromPrimitive + AddAssign + Sum<T>,
     {
-        use rayon::iter::{IntoParallelIterator, ParallelIterator};
         let &Self {
             h, kvh, tile_seq, ..
         } = self;
-        // 生成发送给 kernel 的配置
-        let cfg = self.to_kernel_cfg();
         // 发射 kernel
-        (0..reqs.len())
-            .flat_map(|ireq| (0..kvh).map(move |head| [ireq, head]))
-            .collect::<Box<_>>()
-            .into_par_iter()
-            .for_each(|&[ireq, head]| cache_concat_block(cfg, &cache_pages, &reqs, ireq, head));
-        (0..reqs.len())
-            .flat_map(|ireq| (0..h).map(move |head| [ireq, head]))
-            .collect::<Box<_>>()
-            .into_par_iter()
-            .for_each(|&[ireq, head]| {
-                let mut shared = vec![T::zero(); self.shared_elements()];
-                flash_attn_block(cfg, &cache_pages, &reqs, ireq, head, tile_seq, &mut shared)
-            })
+        let cfg = self.to_kernel_cfg();
+        launch_parallel(reqs.len(), kvh, |ireq, head| {
+            cache_concat_block(cfg, cache_pages, reqs, ireq, head)
+        });
+        launch_parallel(reqs.len(), h, |ireq, head| {
+            let mut shared = vec![T::zero(); self.shared_elements()];
+            flash_attn_block(cfg, cache_pages, reqs, ireq, head, tile_seq, &mut shared)
+        });
     }
+}
+
+fn launch_parallel(y: usize, x: usize, f: impl Fn(usize, usize) + Sync) {
+    (0..y)
+        .into_par_iter()
+        .flat_map(|y| (0..x).into_par_iter().map(move |x| [y, x]))
+        .for_each(|[y, x]| f(y, x))
 }
 
 fn cache_concat_block<T: Copy>(
@@ -90,10 +90,10 @@ fn flash_attn_block<T: Float + FromPrimitive + AddAssign + Sum<T>>(
         o_strides,
         mask,
         n,
-        s_ceil,
+        s,
         ..
     } = &reqs[ireq];
-    let pages = &cache_pages[pages_start..][..s_ceil.div_ceil(bs)];
+    let pages = &cache_pages[pages_start..][..s.div_ceil(bs)];
     // 划分 shared memory
     let (qi, shared) = shared.split_at_mut(bn * d);
     let (oi, shared) = shared.split_at_mut(bn * d);
@@ -141,7 +141,7 @@ fn flash_attn_block<T: Float + FromPrimitive + AddAssign + Sum<T>>(
                 let oi = &mut oi[it * d..][..d];
                 let x = &mut x[it * bs..][..bs];
 
-                let mask = unsafe { from_raw_parts(mask.add(iq * s_ceil + ikvb * bs), bs) };
+                let mask = unsafe { from_raw_parts(mask.add((iq * pages.len() + ikvb) * bs), bs) };
 
                 // 初始化 mi_1, di_1
                 let mi_1 = &mut mi_t[it];
@@ -224,10 +224,7 @@ impl super::FlashAttnCfg {
         &self,
         reqs: &mut [super::test::Attention],
     ) {
-        use super::{
-            Strides2D,
-            test::{Attention, destruct},
-        };
+        use super::{Strides2D, test::Attention};
 
         let &Self { tile_ctx, .. } = self;
         // 生成所有页指针
@@ -257,8 +254,8 @@ impl super::FlashAttnCfg {
                 })
             })
             .collect::<Box<_>>();
-        // 生成 workspace
-        let req_memory = reqs
+        // 生成 mask
+        let masks = reqs
             .iter()
             .map(|req| {
                 let n = req.q.shape()[1];
@@ -274,40 +271,28 @@ impl super::FlashAttnCfg {
         // 为每个请求的每个头生成 block
         let reqs = reqs
             .iter()
-            .zip(&req_memory)
+            .zip(&masks)
             .scan(0, |start, (req, mem)| {
                 let pages_start = *start as _;
                 let n = req.q.shape()[1];
                 Some(KernelReq {
                     q: req.q.get().as_ptr().cast(),
-                    q_strides: {
-                        destruct!([head, seq, _] = req.q.strides());
-                        Strides2D { head, seq }
-                    },
+                    q_strides: Strides2D::from_tensor(&req.q),
                     k: req.k.get().as_ptr().cast(),
-                    k_strides: {
-                        destruct!([head, seq, _] = req.k.strides());
-                        Strides2D { head, seq }
-                    },
+                    k_strides: Strides2D::from_tensor(&req.k),
                     v: req.v.get().as_ptr().cast(),
-                    v_strides: {
-                        destruct!([head, seq, _] = req.v.strides());
-                        Strides2D { head, seq }
-                    },
+                    v_strides: Strides2D::from_tensor(&req.v),
                     pages_start,
-                    kv_strides: {
-                        destruct!([seq, _, head, _] = req.cache.strides());
-                        Strides2D { head, seq }
-                    },
+                    kv_strides: Strides2D::from_tensor(
+                        &req.cache
+                            .as_ref()
+                            .transform(|layout| layout.index(1, 0).transpose(&[1, 0])),
+                    ),
                     o: req.o.get().as_ptr().cast_mut().cast(),
-                    o_strides: {
-                        destruct!([head, seq, _] = req.o.strides());
-                        Strides2D { head, seq }
-                    },
+                    o_strides: Strides2D::from_tensor(&req.o),
                     mask: mem.as_ptr(),
                     n,
                     s: req.pos + n,
-                    s_ceil: (req.pos + n).div_ceil(tile_ctx) * tile_ctx,
                 })
             })
             .collect::<Box<_>>();

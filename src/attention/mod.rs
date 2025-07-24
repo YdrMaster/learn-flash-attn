@@ -59,7 +59,6 @@ pub struct KernelReq<T> {
     pub mask: *const bool,
     pub n: usize,
     pub s: usize,
-    pub s_ceil: usize,
 }
 
 unsafe impl<T: Copy> Sync for KernelReq<T> {}

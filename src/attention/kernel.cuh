@@ -57,7 +57,7 @@ struct KernelReq {
     Strides2D o_strides;
     // config
     bool *const mask;
-    size_t n, s, s_ceil;
+    size_t n, s;
 };
 
 // threads (b) (kvh, d)
@@ -155,7 +155,7 @@ __device__ void flash_attn_block(
             __syncthreads();
             // 每个线程计算 q 的一行
             if (iq < req.n) {
-                bool const *mask = req.mask + iq * req.s_ceil + ikvb * bs;
+                bool const *mask = req.mask + (iq * ikvb_end + ikvb) * bs;
 
                 // score = q @ k^T / √d
                 Tcompute mi = mi_1;

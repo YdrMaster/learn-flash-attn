@@ -1,5 +1,5 @@
 ﻿use crate::attention::{KVPage, KernelReq};
-use cuda::{CurrentCtx, Module, Ptx, Stream, params};
+use cuda::{Module, Stream, params};
 use std::ffi::c_uint;
 
 impl super::FlashAttnCfg {
@@ -42,9 +42,9 @@ impl super::FlashAttnCfg {
     }
 }
 
-pub fn compile<'ctx>(t_compute: &str, t_data: &str, ctx: &'ctx CurrentCtx) -> Module<'ctx> {
+pub fn code(t_compute: &str, t_data: &str) -> String {
     const CODE: &str = include_str!("kernel.cuh");
-    let code = format!(
+    format!(
         r#"{CODE}
 
 extern "C" __global__ void cache_concat(
@@ -60,19 +60,7 @@ extern "C" __global__ void flash_attn(
     KernelReq<{t_data}> const *reqs) {{
     flash_attn_block<{t_compute}>(cfg, cache_pages, reqs);
 }}"#
-    );
-    let cc = ctx.dev().compute_capability();
-    let (ptx, log) = Ptx::compile(code, cc);
-    let ptx = match ptx {
-        Ok(ptx) => {
-            if !log.is_empty() {
-                println!("{log}")
-            }
-            ptx
-        }
-        Err(e) => panic!("{e:?}\n{log}"),
-    };
-    ctx.load(&ptx)
+    )
 }
 
 #[cfg(test)]
@@ -101,6 +89,7 @@ impl super::FlashAttnCfg {
         stream: &cuda::Stream,
     ) {
         use super::{KVPage, KernelReq, Strides2D};
+        use cuda::Ptx;
         use std::iter::zip;
 
         // 生成 GPU 版本
@@ -187,7 +176,18 @@ impl super::FlashAttnCfg {
             })
             .collect::<Box<_>>();
         // 编译及计算
-        let module = compile(t_compute, t_data, stream.ctx());
+        let cc = stream.ctx().dev().compute_capability();
+        let (ptx, log) = Ptx::compile(code(t_compute, t_data), cc);
+        let ptx = match ptx {
+            Ok(ptx) => {
+                if !log.is_empty() {
+                    println!("{log}")
+                }
+                ptx
+            }
+            Err(e) => panic!("{e:?}\n{log}"),
+        };
+        let module = stream.ctx().load(&ptx);
         self.compute_cuda::<T>(&cache_pages, &reqs_, &module, stream);
 
         for ((.., o, cache, _), c) in zip(reqs_o, reqs) {

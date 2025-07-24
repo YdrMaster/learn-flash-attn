@@ -1,6 +1,6 @@
 [package]
-name = "learn-flash-attn"
-version = "0.0.12"
+name = "flash-attn"
+version = "0.0.13"
 edition = "2024"
 authors = [
     "YdrMaster <ydrml@hotmail.com>",
@@ -11,7 +11,7 @@ authors = [
 [dependencies]
 rayon = "1.10"
 num-traits = "0.2"
-cuda = { git = "https://github.com/YdrMaster/cuda-driver", rev = "c2b12d3" }
+cuda = { git = "https://github.com/YdrMaster/cuda-driver", rev = "31c8090" }
 
 [dev-dependencies]
 any-tensor = "0.0"

@@ -163,7 +163,7 @@ __device__ void flash_attn_block(
                     if (mask[i]) {
                         Tcompute qk = 0;
                         for (size_t j = 0; j < d; ++j) {
-                            qk += qi[j] * kj[i * d + j];
+                            qk += (Tcompute)(qi[j] * kj[i * d + j]);
                         }
                         qk *= scale;
                         x[i] = qk;
@@ -178,8 +178,9 @@ __device__ void flash_attn_block(
                     if (!mask[i]) {
                         x[i] = 0;
                     } else {
-                        x[i] = ::exp(x[i] - mi);
-                        sum += x[i];
+                        Tcompute exp = ::exp((Tcompute)x[i] - mi);
+                        x[i] = exp;
+                        sum += exp;
                     }
                 }
 
@@ -193,9 +194,9 @@ __device__ void flash_attn_block(
                 for (size_t j = 0; j < d; ++j) {
                     Tcompute xv = 0;
                     for (size_t i = 0; i < bs; ++i) {
-                        xv += x[i] * vj[i * d + j];
+                        xv += (Tcompute)(x[i] * vj[i * d + j]);
                     }
-                    oi[j] = oi[j] * exp + xv;
+                    oi[j] = (Tcompute)oi[j] * exp + xv;
                 }
             }
             __syncthreads();
@@ -205,7 +206,7 @@ __device__ void flash_attn_block(
             T *o = byte_offset(req.o, req.o_strides.offset(head, iq));
             // 将 oi 写入 o
             for (size_t i = 0; i < d; ++i) {
-                o[i] = oi[i] / di_1;
+                o[i] = (Tcompute)oi[i] / di_1;
             }
         }
     }

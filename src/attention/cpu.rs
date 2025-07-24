@@ -68,7 +68,7 @@ pub fn flash_attn_block<T: Float + FromPrimitive + AddAssign + Sum<T>>(
     let pages = &cache_pages[pages_start..][..s_ceil.div_ceil(bs)];
     // 划分 shared memory
     let (qi, shared) = shared.split_at_mut(bn * d);
-    let (oi_, shared) = shared.split_at_mut(bn * d);
+    let (oi, shared) = shared.split_at_mut(bn * d);
     let (kj, shared) = shared.split_at_mut(bs * d);
     let (vj, x) = shared.split_at_mut(bs * d);
     assert_eq!(x.len(), bn * bs);
@@ -76,19 +76,20 @@ pub fn flash_attn_block<T: Float + FromPrimitive + AddAssign + Sum<T>>(
     for iqb in 0..n.div_ceil(bn) {
         // 每个线程拷贝 q 的一行，拷贝整个 q block 到 local memory
         for it in 0..bn {
-            let offset = q_strides.offset(head, iqb * bn + it);
-            unsafe {
-                copy_nonoverlapping(q.byte_offset(offset), qi[it * d..].as_mut_ptr(), d);
+            let iq = iqb * bn + it;
+            if iq >= n {
+                break;
             }
+            // locate data
+            let qi_ = unsafe { from_raw_parts(q.byte_offset(q_strides.offset(head, iq)), d) };
+            // load data
+            qi[it * d..][..d].copy_from_slice(qi_);
+            // 初始化 oi 为 0
+            oi[it * d..][..d].fill(T::zero())
         }
-
-        //初始化oi为0
-        oi_.fill(T::zero());
-
-        //不必从外面传进来，因为每个线程可以很方便地持有一个
-        let mut mi_1_array = vec![T::neg_infinity(); bn];
-        let mut di_1_array = vec![T::zero(); bn];
-
+        // 初始化 m l
+        let mut mi_t = vec![T::neg_infinity(); bn].into_boxed_slice();
+        let mut di_t = vec![T::zero(); bn].into_boxed_slice();
         // ctx 方向迭代
         for (ikvb, KVPage { k, v }) in pages.iter().enumerate() {
             // 每个线程拷贝 k/v 的一行，拷贝整个 kv block 到 local memory
@@ -101,31 +102,27 @@ pub fn flash_attn_block<T: Float + FromPrimitive + AddAssign + Sum<T>>(
                     }
                 }
             }
-
             // 每个线程计算 q 的一行
             for it in 0..bn {
-                // 计算当前线程qi oi x 对应的索引
-                let qi = &mut qi[it * d..][..d];
-                let oi_ = &mut oi_[it * d..][..d];
-                let x = &mut x[it * bs..][..bs];
-
                 let iq = iqb * bn + it;
                 if iq >= n {
                     break;
                 }
+                // 计算当前线程 qi oi x 对应的索引
+                let qi = &mut qi[it * d..][..d];
+                let oi = &mut oi[it * d..][..d];
+                let x = &mut x[it * bs..][..bs];
 
                 let mask = unsafe { from_raw_parts(mask.add(iq * s_ceil + ikvb * bs), bs) };
 
                 // 初始化 mi_1, di_1
-                let mi_1 = &mut mi_1_array[it];
-                let di_1 = &mut di_1_array[it];
+                let mi_1 = &mut mi_t[it];
+                let di_1 = &mut di_t[it];
 
                 // score = q @ k^T / √d
                 let mut mi = *mi_1;
                 for (i, (mask, x)) in zip(mask, &mut *x).enumerate() {
-                    if !*mask {
-                        *x = T::neg_infinity();
-                    } else {
+                    if *mask {
                         let qk = zip(&*qi, &kj[i * d..][..d])
                             .map(|(&q, &k)| q * k)
                             .sum::<T>()
@@ -138,20 +135,23 @@ pub fn flash_attn_block<T: Float + FromPrimitive + AddAssign + Sum<T>>(
                 }
 
                 let mut sum = T::zero();
-                for x in &mut *x {
-                    *x = (*x - mi).exp();
-                    sum += *x
+                for (mask, x) in zip(mask, &mut *x) {
+                    if !mask {
+                        *x = T::zero()
+                    } else {
+                        *x = (*x - mi).exp();
+                        sum += *x
+                    }
                 }
 
                 let exp = (*mi_1 - mi).exp();
                 let exp_mut_di_1 = *di_1 * exp;
                 let di = exp_mut_di_1 + sum;
-
                 // 更新 m, l
                 *mi_1 = mi;
                 *di_1 = di;
 
-                for (j, oi) in oi_.iter_mut().enumerate() {
+                for (j, oi) in oi.iter_mut().enumerate() {
                     let xv = x
                         .iter()
                         .enumerate()
@@ -161,17 +161,19 @@ pub fn flash_attn_block<T: Float + FromPrimitive + AddAssign + Sum<T>>(
                 }
             }
         }
+
         for it in 0..bn {
-            let oi = &mut oi_[it * d..][..d];
             let iq = iqb * bn + it;
-            let di_1 = &mut di_1_array[it];
             if iq >= n {
                 break;
             }
-            // 将 oi 写入 o
-            oi.iter_mut().for_each(|oi_| *oi_ = *oi_ / *di_1);
             let o = unsafe { from_raw_parts_mut(o.byte_offset(o_strides.offset(head, iq)), d) };
-            o.copy_from_slice(oi);
+            // 将 oi 写入 o
+            let oi = &mut oi[it * d..][..d];
+            let di_1 = di_t[it];
+            for (o, oi) in zip(o, oi) {
+                *o = *oi / di_1
+            }
         }
     }
 }

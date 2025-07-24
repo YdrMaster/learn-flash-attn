@@ -1,6 +1,4 @@
 #include <cuda/std/cstddef>
-#include <cuda_fp16.h>
-#include <cuda_runtime.h>
 
 template <typename T>
 __host__ __device__ T neg_inf();
@@ -126,30 +124,23 @@ __device__ void flash_attn_block(
         iqb_end = div_ceil(req.n, bn);
     // seq 方向迭代
     for (size_t iqb = 0; iqb < iqb_end; ++iqb) {
-        // 每个线程计算 q 的一行
+        // 每个线程拷贝 q 的一行，拷贝整个 q block 到 local memory
         size_t iq = iqb * bn + it;
-
-        T const *q_;
         if (iq < req.n) {
             // locate data
-            q_ = byte_offset(req.q, req.q_strides.offset(head, iq));
-            // load data
-            memcpy(qi, q_, d * sizeof(T));
-
-            // 初始化oi
+            T const *q_ = byte_offset(req.q, req.q_strides.offset(head, iq));
             for (size_t j = 0; j < d; ++j) {
+                // load data
+                qi[j] = q_[j];
+                // 初始化 oi 为 0
                 oi[j] = 0;
             }
         }
-
-        // 初始化m l
+        // 初始化 m l
         Tcompute mi_1 = neg_inf<Tcompute>(),
-                 di_1 = 0.0;
+                 di_1 = 0;
         // ctx 方向迭代
         for (size_t ikvb = 0; ikvb < ikvb_end; ++ikvb) {
-
-            // TODO 这里是否需要同步？
-            __syncthreads();
             // 每个线程拷贝 k/v 的一行，拷贝整个 kv block 到 local memory
             {
                 T const
@@ -162,7 +153,7 @@ __device__ void flash_attn_block(
                 }
             }
             __syncthreads();
-
+            // 每个线程计算 q 的一行
             if (iq < req.n) {
                 bool const *mask = req.mask + iq * req.s_ceil + ikvb * bs;
 
@@ -207,9 +198,12 @@ __device__ void flash_attn_block(
                     oi[j] = oi[j] * exp + xv;
                 }
             }
+            __syncthreads();
         }
+
         if (iq < req.n) {
             T *o = byte_offset(req.o, req.o_strides.offset(head, iq));
+            // 将 oi 写入 o
             for (size_t i = 0; i < d; ++i) {
                 o[i] = oi[i] / di_1;
             }

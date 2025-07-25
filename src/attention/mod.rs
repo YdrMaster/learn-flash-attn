@@ -88,8 +88,15 @@ impl FlashAttnCfg {
             tile_ctx,
             ..
         } = self;
-        // qi oi kj vj x
-        tile_seq * d + tile_seq * d + tile_ctx * d + tile_ctx * d + tile_seq * tile_ctx
+        [
+            tile_seq * d,        // qi
+            tile_seq * d,        // oi
+            tile_ctx * d,        // kj
+            tile_ctx * d,        // vj
+            tile_seq * tile_ctx, // x
+        ]
+        .iter()
+        .sum()
     }
 }
 

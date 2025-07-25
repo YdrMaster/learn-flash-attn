@@ -32,7 +32,7 @@ impl super::FlashAttnCfg {
                 &module.get_kernel(c"flash_attn"),
                 (
                     (reqs.len() as c_uint, h as c_uint),
-                    tile_seq as c_uint,
+                    (tile_seq as c_uint, stream.ctx().dev().warp_size() as c_uint),
                     self.shared_elements() * size_of::<T>(),
                 ),
                 &params.to_ptrs(),

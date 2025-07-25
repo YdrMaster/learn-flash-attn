@@ -1,3 +1,4 @@
+#include <cub/warp/warp_reduce.cuh>
 #include <cuda/std/cstddef>
 
 template <typename T>
@@ -87,7 +88,7 @@ __device__ void cache_concat_block(
     }
 }
 
-// threads (b, h) (bn)
+// threads (b, h) (bn, warp)
 template <typename Tcompute, typename T>
 __device__ void flash_attn_block(
     KernelCfg cfg,
@@ -96,8 +97,10 @@ __device__ void flash_attn_block(
     size_t const
         ireq = blockIdx.y,
         head = blockIdx.x,
-        bn = blockDim.x,
-        it = threadIdx.x;
+        bn = blockDim.y,
+        warp = blockDim.x,
+        it_y = threadIdx.y,
+        lane = threadIdx.x;
 
     size_t const
         g = cfg.g,
@@ -115,25 +118,22 @@ __device__ void flash_attn_block(
       *vj = kj + bs * d,
       *x = vj + bs * d;
     // 定位每个线程的 qi, oi, x
-    qi += it * d;
-    oi += it * d;
-    x += it * bs;
+    qi += it_y * d;
+    oi += it_y * d;
+    x += it_y * bs;
 
     size_t const
         ikvb_end = div_ceil(req.s, bs),
         iqb_end = div_ceil(req.n, bn);
     // seq 方向迭代
     for (size_t iqb = 0; iqb < iqb_end; ++iqb) {
-        // 每个线程拷贝 q 的一行，拷贝整个 q block 到 local memory
-        size_t iq = iqb * bn + it;
+        size_t const iq = iqb * bn + it_y;
+        T const *req_q = byte_offset(req.q, req.q_strides.offset(head, iq));
+        T /***/ *req_o = byte_offset(req.o, req.o_strides.offset(head, iq));
         if (iq < req.n) {
-            // locate data
-            T const *q_ = byte_offset(req.q, req.q_strides.offset(head, iq));
-            for (size_t j = 0; j < d; ++j) {
-                // load data
-                qi[j] = q_[j];
-                // 初始化 oi 为 0
-                oi[j] = 0;
+            for (size_t i = lane; i < d; i += warp) {
+                qi[i] = req_q[i]; // 加载 qi
+                oi[i] = 0;        // 初始化 oi 为 0
             }
         }
         // 初始化 m l
@@ -141,46 +141,57 @@ __device__ void flash_attn_block(
                  di_1 = 0;
         // ctx 方向迭代
         for (size_t ikvb = 0; ikvb < ikvb_end; ++ikvb) {
+            bool const *mask = req.mask + (iq * ikvb_end + ikvb) * bs;
             // 每个线程拷贝 k/v 的一行，拷贝整个 kv block 到 local memory
-            {
-                T const
-                    *k = (cache_pages + req.pages_start + ikvb)->k,
-                    *v = (cache_pages + req.pages_start + ikvb)->v;
-                for (size_t i = it; i < bs; i += bn) {
-                    ptrdiff_t const offset = req.kv_strides.offset(head / g, i);
-                    memcpy(kj + i * d, byte_offset(k, offset), d * sizeof(T));
-                    memcpy(vj + i * d, byte_offset(v, offset), d * sizeof(T));
+            T const
+                *k = (cache_pages + req.pages_start + ikvb)->k,
+                *v = (cache_pages + req.pages_start + ikvb)->v;
+            for (size_t i = it_y; i < bs; i += bn) {
+                ptrdiff_t const offset = req.kv_strides.offset(head / g, i);
+                for (size_t j = lane; j < d; j += warp) {
+                    kj[i * d + j] = byte_offset(k, offset)[j];
+                    vj[i * d + j] = byte_offset(v, offset)[j];
                 }
             }
             __syncthreads();
-            // 每个线程计算 q 的一行
+            // 每个线程束计算 q 的一行
             if (iq < req.n) {
-                bool const *mask = req.mask + (iq * ikvb_end + ikvb) * bs;
-
+                Tcompute mi = mi_1, sum = 0;
                 // score = q @ k^T / √d
-                Tcompute mi = mi_1;
-                for (size_t i = 0; i < bs; ++i) {
-                    if (mask[i]) {
-                        Tcompute qk = 0;
-                        for (size_t j = 0; j < d; ++j) {
-                            qk += (Tcompute)(qi[j] * kj[i * d + j]);
-                        }
-                        qk *= scale;
-                        x[i] = qk;
-                        if (qk > mi) {
-                            mi = qk;
-                        }
-                    }
-                }
-
-                Tcompute sum = 0;
                 for (size_t i = 0; i < bs; ++i) {
                     if (!mask[i]) {
-                        x[i] = 0;
+                        continue;
+                    }
+                    Tcompute qk = 0;
+                    for (size_t j = lane; j < d; j += warp) {
+                        qk += (Tcompute)(qi[j] * kj[i * d + j]);
+                    }
+                    {
+                        using WarpReduce = cub::WarpReduce<Tcompute>;
+                        __shared__ typename WarpReduce::TempStorage temp_storage;
+                        qk = __shfl_sync(0xFFFFFFFF, WarpReduce(temp_storage).Sum(qk, d), 0);
+                        __syncwarp();
+                    }
+                    qk *= scale;
+                    // lane 0
+                    if (lane == 0) {
+                        x[i] = qk;
+                    }
+                    if (mi < qk) {
+                        mi = qk;
+                    }
+                }
+                for (size_t i = 0; i < bs; ++i) {
+                    if (!mask[i]) {
+                        if (lane == 0) {
+                            x[i] = 0;
+                        }
                     } else {
                         Tcompute exp = ::exp((Tcompute)x[i] - mi);
-                        x[i] = exp;
                         sum += exp;
+                        if (lane == 0) {
+                            x[i] = exp;
+                        }
                     }
                 }
 
@@ -190,23 +201,21 @@ __device__ void flash_attn_block(
                 // 更新 m, l
                 mi_1 = mi;
                 di_1 = di;
-
-                for (size_t j = 0; j < d; ++j) {
+                // 同步 m, d
+                for (size_t i = lane; i < d; i += warp) {
                     Tcompute xv = 0;
-                    for (size_t i = 0; i < bs; ++i) {
-                        xv += (Tcompute)(x[i] * vj[i * d + j]);
+                    for (size_t k = 0; k < bs; ++k) {
+                        xv += (Tcompute)(x[k] * vj[k * d + i]);
                     }
-                    oi[j] = (Tcompute)oi[j] * exp + xv;
+                    oi[i] = (Tcompute)oi[i] * exp + xv;
                 }
             }
             __syncthreads();
         }
-
+        // 将 oi 写入 o
         if (iq < req.n) {
-            T *o = byte_offset(req.o, req.o_strides.offset(head, iq));
-            // 将 oi 写入 o
-            for (size_t i = 0; i < d; ++i) {
-                o[i] = (Tcompute)oi[i] / di_1;
+            for (size_t i = lane; i < d; i += warp) {
+                req_o[i] = (Tcompute)oi[i] / di_1;
             }
         }
     }

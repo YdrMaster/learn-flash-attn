@@ -1,4 +1,4 @@
-﻿use crate::attention::{KVPage, KernelCfg, KernelReq};
+﻿use super::{AttnType, KVPage, KernelCfg, KernelReq};
 use num_traits::{Float, FromPrimitive};
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use std::{
@@ -87,9 +87,10 @@ fn flash_attn_block<T: Float + FromPrimitive + AddAssign + Sum<T>>(
         kv_strides,
         o,
         o_strides,
-        mask,
         n,
         s,
+        ty,
+        mask,
         ..
     } = &reqs[ireq];
     let pages = &cache_pages[pages_start..][..s.div_ceil(bs)];
@@ -154,10 +155,20 @@ fn flash_attn_block<T: Float + FromPrimitive + AddAssign + Sum<T>>(
                         continue;
                     }
 
+                    // 用于计算 mask
+                    let pos = s - n;
+                    let kv_pos_base = ikvb * bs;
+
                     // score = q @ k^T / √d
                     let mut mi = *mi_1;
                     for (i, (mask, x)) in zip(mask, &mut *x).enumerate() {
-                        if *mask {
+                        let is_valid = match ty {
+                            AttnType::Full => true,
+                            AttnType::Causal => kv_pos_base + i <= pos + iq,
+                            AttnType::CustomMask => *mask,
+                        };
+
+                        if is_valid {
                             let qk = zip(&*qi, &kj[i * d..][..d])
                                 .map(|(&q, &k)| q * k)
                                 .sum::<T>()
@@ -170,8 +181,14 @@ fn flash_attn_block<T: Float + FromPrimitive + AddAssign + Sum<T>>(
                     }
 
                     let mut sum = T::zero();
-                    for (mask, x) in zip(mask, &mut *x) {
-                        if !mask {
+                    for (i, (mask, x)) in zip(mask, &mut *x).enumerate() {
+                        let is_valid = match ty {
+                            AttnType::Full => true,
+                            AttnType::Causal => kv_pos_base + i <= pos + iq,
+                            AttnType::CustomMask => *mask,
+                        };
+
+                        if !is_valid {
                             *x = T::zero()
                         } else {
                             *x = (*x - mi).exp();
@@ -230,7 +247,7 @@ impl super::FlashAttnCfg {
         &self,
         reqs: &mut [super::test::Attention],
     ) {
-        use super::{Strides2D, test::Attention};
+        use super::{AttnType, Strides2D, test::Attention};
 
         let &Self { tile_ctx, .. } = self;
         // 生成所有页指针
@@ -299,6 +316,7 @@ impl super::FlashAttnCfg {
                     mask: mem.as_ptr(),
                     n,
                     s: req.pos + n,
+                    ty: AttnType::Causal,
                 })
             })
             .collect::<Box<_>>();

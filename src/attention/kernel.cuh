@@ -41,6 +41,12 @@ struct Strides2D {
     }
 };
 
+enum class AttnType : uint8_t {
+    Full = 0,
+    Causal = 1,
+    CustomMask = 255,
+};
+
 template <typename T>
 struct KernelReq {
     // qurey
@@ -57,8 +63,9 @@ struct KernelReq {
     T *o;
     Strides2D o_strides;
     // config
-    bool *const mask;
     size_t n, s;
+    AttnType ty;
+    bool *const mask;
 };
 
 // threads (b) (kvh, d)
@@ -157,9 +164,26 @@ __device__ void flash_attn_block(
             // 每个线程束计算 q 的一行
             if (iq < req.n) {
                 Tcompute mi = mi_1, sum = 0;
+                // 用于计算 mask
+                size_t pos = req.s - req.n;
+                size_t kv_pos_base = ikvb * bs;
                 // score = q @ k^T / √d
                 for (size_t i = 0; i < bs; ++i) {
-                    if (!mask[i]) {
+                    bool is_valid;
+                    switch (req.ty) {
+                    case AttnType::Full:
+                        is_valid = true;
+                        break;
+                    case AttnType::Causal:
+                        is_valid = kv_pos_base + i <= pos + iq;
+                        break;
+                    case AttnType::CustomMask:
+                    default:
+                        is_valid = mask[i];
+                        break;
+                    }
+
+                    if (!is_valid) {
                         continue;
                     }
                     Tcompute qk = 0;
@@ -182,7 +206,21 @@ __device__ void flash_attn_block(
                     }
                 }
                 for (size_t i = 0; i < bs; ++i) {
-                    if (!mask[i]) {
+                    bool is_valid;
+                    switch (req.ty) {
+                    case AttnType::Full:
+                        is_valid = true;
+                        break;
+                    case AttnType::Causal:
+                        is_valid = kv_pos_base + i <= pos + iq;
+                        break;
+                    case AttnType::CustomMask:
+                    default:
+                        is_valid = mask[i];
+                        break;
+                    }
+
+                    if (!is_valid) {
                         if (lane == 0) {
                             x[i] = 0;
                         }

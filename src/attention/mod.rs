@@ -56,12 +56,21 @@ pub struct KernelReq<T> {
     pub kv_strides: Strides2D,
     pub o: *mut T,
     pub o_strides: Strides2D,
-    pub mask: *const bool,
     pub n: usize,
     pub s: usize,
+    pub ty: AttnType,
+    pub mask: *const bool,
 }
 
 unsafe impl<T: Copy> Sync for KernelReq<T> {}
+
+#[derive(Clone, Copy, Debug)]
+#[repr(u8)]
+pub enum AttnType {
+    Full = 0,
+    Causal = 1,
+    CustomMask = 255,
+}
 
 impl FlashAttnCfg {
     pub fn to_kernel_cfg(&self) -> KernelCfg {

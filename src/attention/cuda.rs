@@ -133,25 +133,10 @@ impl super::FlashAttnCfg {
                 })
             })
             .collect::<Box<_>>();
-        // 生成 mask
-        let masks = reqs_o
-            .iter()
-            .map(|(q, _, _, _, _, pos)| {
-                let n = q.shape()[1];
-                let s = pos + n;
-                let s_ceil = s.div_ceil(tile_ctx) * tile_ctx;
-                // 注意力掩码
-                let mask = (0..n * s_ceil)
-                    .map(|i| i % s_ceil <= s - n + i / s_ceil)
-                    .collect::<Box<_>>();
-                stream.from_host(&mask)
-            })
-            .collect::<Box<_>>();
         // 为每个请求的每个头生成 block
         let reqs_ = reqs_o
             .iter()
-            .zip(&masks)
-            .scan(0, |start, ((q, k, v, o, cache, pos), mem)| {
+            .scan(0, |start, (q, k, v, o, cache, pos)| {
                 let pages_start = *start as _;
                 let n = q.shape()[1];
                 Some(KernelReq::<T> {
@@ -169,9 +154,10 @@ impl super::FlashAttnCfg {
                     ),
                     o: o.get().as_ptr().cast_mut().cast(),
                     o_strides: Strides2D::from_tensor(o),
-                    mask: mem.as_ptr().cast(),
                     n,
                     s: n + pos,
+                    ty: crate::attention::AttnType::Causal,
+                    mask: std::ptr::null(),
                 })
             })
             .collect::<Box<_>>();

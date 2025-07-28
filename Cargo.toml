@@ -11,7 +11,7 @@ authors = [
 [dependencies]
 rayon = "1.10"
 num-traits = "0.2"
-cuda = { git = "https://github.com/YdrMaster/cuda-driver", rev = "31c8090" }
+cuda = { git = "https://github.com/YdrMaster/cuda-driver", rev = "803d64b" }
 
 [dev-dependencies]
 any-tensor = "0.0"
@@ -20,3 +20,4 @@ rand = "0.9"
 [build-dependencies]
 build-script-cfg = "0.1"
 find_cuda_helper = "0.2"
+search-maca-tools = { git = "https://github.com/YdrMaster/cuda-driver", rev = "803d64b" }

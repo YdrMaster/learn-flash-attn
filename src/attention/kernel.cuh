@@ -58,6 +58,8 @@ struct KernelReq {
     Strides2D o_strides;
     // config
     bool *const mask;
+    // 用于表明是否为causal mask，如果是则忽略mask指针，在计算时自动生成
+    bool is_causal_mask;
     size_t n, s;
 };
 
@@ -156,10 +158,24 @@ __device__ void flash_attn_block(
             __syncthreads();
             // 每个线程束计算 q 的一行
             if (iq < req.n) {
-                Tcompute mi = mi_1, sum = 0;
+                Tcompute mi = mi_1,
+                         sum = 0;
+
+                // 用于计算 mask
+                size_t pos = req.s - req.n;
+                size_t kv_pos_base = ikvb * bs;
+
                 // score = q @ k^T / √d
                 for (size_t i = 0; i < bs; ++i) {
-                    if (!mask[i]) {
+                    bool is_valid;
+                    if (req.is_causal_mask) {
+                        size_t kv_pos = kv_pos_base + i;
+                        is_valid = kv_pos <= pos + iq;
+                    } else {
+                        is_valid = mask[i];
+                    }
+
+                    if (!is_valid) {
                         continue;
                     }
                     Tcompute qk = 0;
@@ -182,7 +198,15 @@ __device__ void flash_attn_block(
                     }
                 }
                 for (size_t i = 0; i < bs; ++i) {
-                    if (!mask[i]) {
+                    bool is_valid;
+                    if (req.is_causal_mask) {
+                        size_t kv_pos = kv_pos_base + i;
+                        is_valid = kv_pos <= pos + iq;
+                    } else {
+                        is_valid = mask[i];
+                    }
+
+                    if (!is_valid) {
                         if (lane == 0) {
                             x[i] = 0;
                         }

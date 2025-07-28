@@ -49,7 +49,7 @@ fn test_flash_attention() {
     const H: usize = 32;
     const KVH: usize = 8;
     const N: usize = 7;
-    const S: usize = 1000;
+    const S: usize = 1024;
     const P: usize = S - N;
     const D: usize = 64;
 
@@ -104,7 +104,7 @@ fn test_flash_attention() {
             cache: cache.as_ref().map(|_| erase_ty_mut(&mut cache_res)),
             pos: P,
         }];
-        FLASH_ATTN.test_compute_cpu(&mut reqs);
+        FLASH_ATTN.test_compute_cpu(true, &mut reqs);
 
         let max = zip(ans.clone(), res)
             .chain(zip(cache_ans.clone(), cache_res))
@@ -129,7 +129,7 @@ fn test_flash_attention() {
         cuda::init().unwrap();
         cuda::Device::new(0)
             .context()
-            .apply(move |ctx| FLASH_ATTN.test_compute_cuda(&mut reqs, &ctx.stream()));
+            .apply(move |ctx| FLASH_ATTN.test_compute_cuda(&mut reqs, true, &ctx.stream()));
 
         let max = zip(ans.clone(), res)
             .chain(zip(cache_ans.clone(), cache_res))

@@ -11,7 +11,7 @@ authors = [
 [dependencies]
 rayon = "1.10"
 num-traits = "0.2"
-cuda = { git = "https://github.com/YdrMaster/cuda-driver", rev = "31c8090" }
+cuda = { git = "https://github.com/YdrMaster/cuda-driver", rev = "803d64b" }
 
 [dev-dependencies]
 any-tensor = "0.0"

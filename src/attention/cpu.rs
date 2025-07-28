@@ -88,6 +88,7 @@ fn flash_attn_block<T: Float + FromPrimitive + AddAssign + Sum<T>>(
         o,
         o_strides,
         mask,
+        is_causal_mask,
         n,
         s,
         ..
@@ -154,10 +155,21 @@ fn flash_attn_block<T: Float + FromPrimitive + AddAssign + Sum<T>>(
                         continue;
                     }
 
+                    // 用于计算 mask
+                    let pos = s - n;
+                    let kv_pos_base = ikvb * bs;
+
                     // score = q @ k^T / √d
                     let mut mi = *mi_1;
                     for (i, (mask, x)) in zip(mask, &mut *x).enumerate() {
-                        if *mask {
+                        let is_valid = if is_causal_mask {
+                            let kv_pos = kv_pos_base + i;
+                            kv_pos <= pos + iq
+                        } else {
+                            *mask
+                        };
+
+                        if is_valid {
                             let qk = zip(&*qi, &kj[i * d..][..d])
                                 .map(|(&q, &k)| q * k)
                                 .sum::<T>()
@@ -170,8 +182,15 @@ fn flash_attn_block<T: Float + FromPrimitive + AddAssign + Sum<T>>(
                     }
 
                     let mut sum = T::zero();
-                    for (mask, x) in zip(mask, &mut *x) {
-                        if !mask {
+                    for (i, (mask, x)) in zip(mask, &mut *x).enumerate() {
+                        let is_valid = if is_causal_mask {
+                            let kv_pos = ikvb * bs + i;
+                            kv_pos <= pos + iq
+                        } else {
+                            *mask
+                        };
+
+                        if !is_valid {
                             *x = T::zero()
                         } else {
                             *x = (*x - mi).exp();
@@ -214,20 +233,25 @@ fn flash_attn_block<T: Float + FromPrimitive + AddAssign + Sum<T>>(
 
 #[cfg(test)]
 impl super::FlashAttnCfg {
-    pub(super) fn test_compute_cpu(&self, reqs: &mut [super::test::Attention]) {
+    pub(super) fn test_compute_cpu(
+        &self,
+        use_is_causal_mask: bool,
+        reqs: &mut [super::test::Attention],
+    ) {
         use crate::attention::test::distinct;
         use any_tensor::digit_layout::types;
 
         let dt = reqs.iter().map(|req| req.dt()).collect::<Box<_>>();
         match distinct(&dt).unwrap() {
-            types::F32 => self.test_compute_cpu_::<f32>(reqs),
-            types::F64 => self.test_compute_cpu_::<f64>(reqs),
+            types::F32 => self.test_compute_cpu_::<f32>(use_is_causal_mask, reqs),
+            types::F64 => self.test_compute_cpu_::<f64>(use_is_causal_mask, reqs),
             others => panic!("Unsupported data type {others}"),
         }
     }
 
     fn test_compute_cpu_<T: Float + FromPrimitive + AddAssign + Sum<T>>(
         &self,
+        use_is_causal_mask: bool,
         reqs: &mut [super::test::Attention],
     ) {
         use super::{Strides2D, test::Attention};
@@ -297,6 +321,7 @@ impl super::FlashAttnCfg {
                     o: req.o.get().as_ptr().cast_mut().cast(),
                     o_strides: Strides2D::from_tensor(&req.o),
                     mask: mem.as_ptr(),
+                    is_causal_mask: use_is_causal_mask,
                     n,
                     s: req.pos + n,
                 })

@@ -68,6 +68,7 @@ impl super::FlashAttnCfg {
     pub(super) fn test_compute_cuda(
         &self,
         reqs: &mut [super::test::Attention],
+        use_is_causal_mask: bool,
         stream: &cuda::Stream,
     ) {
         use crate::attention::test::distinct;
@@ -75,8 +76,12 @@ impl super::FlashAttnCfg {
 
         let dt = reqs.iter().map(|req| req.dt()).collect::<Box<_>>();
         match distinct(&dt).unwrap() {
-            types::F32 => self.test_compute_cuda_::<f32>(reqs, "float", "float", stream),
-            types::F64 => self.test_compute_cuda_::<f64>(reqs, "double", "double", stream),
+            types::F32 => {
+                self.test_compute_cuda_::<f32>(reqs, use_is_causal_mask, "float", "float", stream)
+            }
+            types::F64 => {
+                self.test_compute_cuda_::<f64>(reqs, use_is_causal_mask, "double", "double", stream)
+            }
             others => panic!("Unsupported data type {others}"),
         }
     }
@@ -84,6 +89,7 @@ impl super::FlashAttnCfg {
     fn test_compute_cuda_<T: num_traits::Float>(
         &self,
         reqs: &mut [super::test::Attention],
+        use_is_causal_mask: bool,
         t_compute: &str,
         t_data: &str,
         stream: &cuda::Stream,
@@ -134,19 +140,28 @@ impl super::FlashAttnCfg {
             })
             .collect::<Box<_>>();
         // 生成 mask
-        let masks = reqs_o
-            .iter()
-            .map(|(q, _, _, _, _, pos)| {
-                let n = q.shape()[1];
-                let s = pos + n;
-                let s_ceil = s.div_ceil(tile_ctx) * tile_ctx;
-                // 注意力掩码
-                let mask = (0..n * s_ceil)
-                    .map(|i| i % s_ceil <= s - n + i / s_ceil)
-                    .collect::<Box<_>>();
-                stream.from_host(&mask)
-            })
-            .collect::<Box<_>>();
+        let masks = if use_is_causal_mask {
+            // 如果是 causal mask，则不需要传入 mask
+            (0..reqs_o.len())
+                .map(|_| stream.malloc::<bool>(0))
+                .collect::<Box<_>>()
+        } else {
+            // 否则直接使用传入的 mask
+            reqs_o
+                .iter()
+                .map(|(q, _, _, _, _, pos)| {
+                    let n = q.shape()[1];
+                    let s = pos + n;
+                    let s_ceil = s.div_ceil(tile_ctx) * tile_ctx;
+                    // 注意力掩码
+                    let mask = (0..n * s_ceil)
+                        .map(|i| i % s_ceil <= s - n + i / s_ceil)
+                        .collect::<Box<_>>();
+                    stream.from_host(&mask)
+                })
+                .collect::<Box<_>>()
+        };
+
         // 为每个请求的每个头生成 block
         let reqs_ = reqs_o
             .iter()
@@ -170,6 +185,7 @@ impl super::FlashAttnCfg {
                     o: o.get().as_ptr().cast_mut().cast(),
                     o_strides: Strides2D::from_tensor(o),
                     mask: mem.as_ptr().cast(),
+                    is_causal_mask: use_is_causal_mask,
                     n,
                     s: n + pos,
                 })

@@ -57,6 +57,8 @@ pub struct KernelReq<T> {
     pub o: *mut T,
     pub o_strides: Strides2D,
     pub mask: *const bool,
+    // 用于表明是否为causal mask，如果是则忽略mask指针，在计算时自动生成
+    pub is_causal_mask: bool,
     pub n: usize,
     pub s: usize,
 }

@@ -68,15 +68,15 @@ struct KernelReq {
     bool *const mask;
 };
 
-// threads (b) (kvh, d)
+// threads (b, kvh) (d)
 template <typename T>
 __device__ void cache_concat_block(
     KernelCfg cfg,
     KVPage<T> const *cache_pages,
     KernelReq<T> const *reqs) {
     size_t const
-        ireq = blockIdx.x,
-        head = threadIdx.y,
+        ireq = blockIdx.y,
+        head = blockIdx.x,
         it = threadIdx.x;
 
     KernelReq const req = reqs[ireq];

@@ -25,7 +25,7 @@ impl super::FlashAttnCfg {
         stream
             .launch(
                 &module.get_kernel(c"cache_concat"),
-                (reqs.len() as c_uint, (kvh as c_uint, d as c_uint), 0),
+                ((reqs.len() as c_uint, kvh as c_uint), d as c_uint, 0),
                 &params.to_ptrs(),
             )
             .launch(

@@ -193,7 +193,7 @@ __device__ void flash_attn_block(
                     {
                         using WarpReduce = cub::WarpReduce<Tcompute>;
                         __shared__ typename WarpReduce::TempStorage temp_storage;
-                        qk = __shfl_sync(0xFFFFFFFF, WarpReduce(temp_storage).Sum(qk, d), 0);
+                        qk = __shfl_sync(0xFFFF'FFFF'FFFF'FFFF, WarpReduce(temp_storage).Sum(qk, d), 0);
                         __syncwarp();
                     }
                     qk *= scale;

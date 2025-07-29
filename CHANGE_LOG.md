@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.14] - 2025-07-2
+
+### Changed
+
+- 根据实际经验改正功能和性能：
+  - 提高 kernel 并行度，head dim 分布到一个线程束上计算；
+  - 添加注意力类型参数指定请求的注意力屏蔽模式，并针对因果注意力优化；
+  - 改变缓存连接 kernel 的并行方式；
+  - 兼容 f16、bf16；
+
 ## [0.0.13] - 2025-07-24
 
 ### Add

@@ -113,7 +113,7 @@ __device__ void flash_attn_block(
         g = cfg.g,
         d = cfg.d,
         bs = cfg.bs;
-    float const
+    Tcompute const
         scale = cfg.scale;
     KernelReq const
         req = reqs[ireq];
@@ -134,8 +134,9 @@ __device__ void flash_attn_block(
         iqb_end = div_ceil(req.n, bn);
     // seq 方向迭代
     for (size_t iqb = 0; iqb < iqb_end; ++iqb) {
-        size_t const iq = iqb * bn + it_y,
-                     causal_end = req.ty == AttnType::Causal ? req.s - req.n + iq : (size_t)-1;
+        size_t const
+            iq = iqb * bn + it_y,
+            causal_end = req.ty == AttnType::Causal ? req.s - req.n + iq : (size_t)-1;
         T const *req_q = byte_offset(req.q, req.q_strides.offset(head, iq));
         T /***/ *req_o = byte_offset(req.o, req.o_strides.offset(head, iq));
         if (iq < req.n) {
@@ -149,31 +150,34 @@ __device__ void flash_attn_block(
                  di_1 = 1e-6; // 避免除 0
         // ctx 方向迭代
         for (size_t ikvb = 0; ikvb < ikvb_end; ++ikvb) {
-            if (ikvb * bs > causal_end) {
+            size_t const kv_base = ikvb * bs;
+            if (kv_base > causal_end) {
                 break;
             }
+            size_t const s_end =
+                kv_base + bs > causal_end
+                    ? causal_end - kv_base + 1
+                    : bs;
 
             // 每个线程拷贝 k/v 的一行，拷贝整个 kv block 到 local memory
-            T const
-                *k = (cache_pages + req.pages_start + ikvb)->k,
-                *v = (cache_pages + req.pages_start + ikvb)->v;
+            T const *k = (cache_pages + req.pages_start + ikvb)->k,
+                    *v = (cache_pages + req.pages_start + ikvb)->v;
             for (size_t i = it_y; i < bs; i += bn) {
                 ptrdiff_t const offset = req.kv_strides.offset(head / g, i);
+                T const *k_ = byte_offset(k, offset),
+                        *v_ = byte_offset(v, offset);
                 for (size_t j = lane; j < d; j += warp) {
-                    kj[i * d + j] = byte_offset(k, offset)[j];
-                    vj[i * d + j] = byte_offset(v, offset)[j];
+                    kj[i * d + j] = k_[j];
+                    vj[i * d + j] = v_[j];
                 }
             }
             __syncthreads();
             // 每个线程束计算 q 的一行
             if (iq < req.n) {
-                bool const *mask = req.mask + (iq * ikvb_end + ikvb) * bs;
+                bool const *mask = req.mask + iq * ikvb_end * bs + kv_base;
                 Tcompute mi = mi_1, sum = 0;
                 // score = q @ k^T / √d
-                for (size_t i = 0; i < bs; ++i) {
-                    if (ikvb * bs + i > causal_end) {
-                        break;
-                    }
+                for (size_t i = 0; i < s_end; ++i) {
                     if (req.ty == AttnType::CustomMask && !mask[i]) {
                         continue;
                     }
@@ -196,10 +200,7 @@ __device__ void flash_attn_block(
                         mi = qk;
                     }
                 }
-                for (size_t i = 0; i < bs; ++i) {
-                  if (ikvb * bs + i > causal_end) {
-                        break;
-                    }
+                for (size_t i = 0; i < s_end; ++i) {
                     if (req.ty == AttnType::CustomMask && !mask[i]) {
                         continue;
                     }
@@ -211,22 +212,17 @@ __device__ void flash_attn_block(
                     }
                 }
 
-                Tcompute exp = ::exp(mi_1 - mi),
-                         di = di_1 * exp + sum;
+                Tcompute const exp = ::exp(mi_1 - mi);
                 // 更新 m, l
                 mi_1 = mi;
-                di_1 = di;
-                // 同步 m, d
+                di_1 = di_1 * exp + sum;
                 for (size_t i = lane; i < d; i += warp) {
                     Tcompute xv = 0;
-                    for (size_t k = 0; k < bs; ++k) {
-                        if (ikvb * bs + k > causal_end) {
-                            break;
-                        }
-                        if (req.ty == AttnType::CustomMask && !mask[k]) {
+                    for (size_t j = 0; j < s_end; ++j) {
+                        if (req.ty == AttnType::CustomMask && !mask[j]) {
                             continue;
                         }
-                        xv += (Tcompute)(x[k] * vj[k * d + i]);
+                        xv += (Tcompute)(x[j] * vj[j * d + i]);
                     }
                     oi[i] = (Tcompute)oi[i] * exp + xv;
                 }

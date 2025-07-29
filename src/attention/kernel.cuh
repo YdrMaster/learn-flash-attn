@@ -1,25 +1,41 @@
 #include <cub/warp/warp_reduce.cuh>
 #include <cuda/std/cstddef>
 
+// 生成平台无关的负无穷编码
+
 template <typename T>
-__host__ __device__ T neg_inf();
+__host__ __device__ __forceinline__ T neg_inf();
 
 template <>
-__host__ __device__ float neg_inf<float>() {
+__host__ __device__ __forceinline__ float neg_inf<float>() {
     return __int_as_float(0xFF800000);
 }
 
 template <>
-__host__ __device__ double neg_inf<double>() {
+__host__ __device__ __forceinline__ double neg_inf<double>() {
     return __longlong_as_double(0xFFF0000000000000ULL);
 }
 
-__device__ size_t div_ceil(size_t a, size_t b) {
+// 调用特定类型的融合乘加命令
+
+template <typename T>
+__host__ __device__ __forceinline__ void fma_(T const &a, T const &b, T &c) {
+    c += a * b;
+}
+
+template <>
+__host__ __device__ __forceinline__ void fma_<float>(float const &a, float const &b, float &c) {
+    c = fmaf(a, b, c);
+}
+
+// 工具函数
+
+__host__ __device__ __forceinline__ size_t div_ceil(size_t a, size_t b) {
     return (a + b - 1) / b;
 }
 
 template <typename T>
-__device__ T *byte_offset(T *ptr, ptrdiff_t diff) {
+__host__ __device__ __forceinline__ T *byte_offset(T *ptr, ptrdiff_t diff) {
     return (T *)(((char *)ptr) + diff);
 }
 
@@ -36,7 +52,7 @@ struct KVPage {
 struct Strides2D {
     ptrdiff_t head, seq;
 
-    __device__ ptrdiff_t offset(size_t head_, size_t seq_) const {
+    __host__ __device__ __forceinline__ ptrdiff_t offset(size_t head_, size_t seq_) const {
         return head_ * head + seq_ * seq;
     }
 };
@@ -184,7 +200,7 @@ __device__ void flash_attn_block(
 
                     Tcompute qk = 0;
                     for (size_t j = lane; j < d; j += warp) {
-                        qk += (Tcompute)(qi[j] * kj[i * d + j]);
+                        fma_<Tcompute>(qi[j], kj[i * d + j], qk);
                     }
                     {
                         using WarpReduce = cub::WarpReduce<Tcompute>;
@@ -222,7 +238,7 @@ __device__ void flash_attn_block(
                         if (req.ty == AttnType::CustomMask && !mask[j]) {
                             continue;
                         }
-                        xv += (Tcompute)(x[j] * vj[j * d + i]);
+                        fma_<Tcompute>(x[j], vj[j * d + i], xv);
                     }
                     oi[i] = (Tcompute)oi[i] * exp + xv;
                 }
@@ -231,8 +247,9 @@ __device__ void flash_attn_block(
         }
         // 将 oi 写入 o
         if (iq < req.n) {
+            Tcompute k = 1 / di_1;
             for (size_t i = lane; i < d; i += warp) {
-                req_o[i] = (Tcompute)oi[i] / di_1;
+                req_o[i] = (Tcompute)oi[i] * k;
             }
         }
     }

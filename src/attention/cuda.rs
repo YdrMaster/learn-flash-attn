@@ -2,8 +2,33 @@
 use cuda::{Module, Stream, params};
 use std::ffi::c_uint;
 
+pub trait NVDT: Copy {
+    const COMPUTE_TYPE_NAME: &str;
+    const DATA_TYPE_NAME: &str;
+}
+
+impl NVDT for half::f16 {
+    const COMPUTE_TYPE_NAME: &str = "float";
+    const DATA_TYPE_NAME: &str = "half";
+}
+
+impl NVDT for half::bf16 {
+    const COMPUTE_TYPE_NAME: &str = "float";
+    const DATA_TYPE_NAME: &str = "nv_bfloat16";
+}
+
+impl NVDT for f32 {
+    const COMPUTE_TYPE_NAME: &str = "float";
+    const DATA_TYPE_NAME: &str = "float";
+}
+
+impl NVDT for f64 {
+    const COMPUTE_TYPE_NAME: &str = "double";
+    const DATA_TYPE_NAME: &str = "double";
+}
+
 impl super::FlashAttnCfg {
-    pub fn compute_cuda<T: Copy>(
+    pub fn compute_cuda<T: NVDT>(
         &self,
         cache_pages: &[KVPage<T>],
         reqs: &[KernelReq<T>],
@@ -42,8 +67,10 @@ impl super::FlashAttnCfg {
     }
 }
 
-pub fn code(t_compute: &str, t_data: &str) -> String {
+pub fn code<T: NVDT>() -> String {
     const CODE: &str = include_str!("kernel.cuh");
+    let t_data: &str = T::DATA_TYPE_NAME;
+    let t_compute: &str = T::COMPUTE_TYPE_NAME;
     format!(
         r#"{CODE}
 
@@ -75,17 +102,17 @@ impl super::FlashAttnCfg {
 
         let dt = reqs.iter().map(|req| req.dt()).collect::<Box<_>>();
         match distinct(&dt).unwrap() {
-            types::F32 => self.test_compute_cuda_::<f32>(reqs, "float", "float", stream),
-            types::F64 => self.test_compute_cuda_::<f64>(reqs, "double", "double", stream),
+            types::F16 => self.test_compute_cuda_::<half::f16>(reqs, stream),
+            types::BF16 => self.test_compute_cuda_::<half::bf16>(reqs, stream),
+            types::F32 => self.test_compute_cuda_::<f32>(reqs, stream),
+            types::F64 => self.test_compute_cuda_::<f64>(reqs, stream),
             others => panic!("Unsupported data type {others}"),
         }
     }
 
-    fn test_compute_cuda_<T: num_traits::Float>(
+    fn test_compute_cuda_<T: NVDT>(
         &self,
         reqs: &mut [super::test::Attention],
-        t_compute: &str,
-        t_data: &str,
         stream: &cuda::Stream,
     ) {
         use super::{KVPage, KernelReq, Strides2D};
@@ -163,7 +190,7 @@ impl super::FlashAttnCfg {
             .collect::<Box<_>>();
         // 编译及计算
         let cc = stream.ctx().dev().compute_capability();
-        let (ptx, log) = Ptx::compile(code(t_compute, t_data), cc);
+        let (ptx, log) = Ptx::compile(code::<T>(), cc);
         let ptx = match ptx {
             Ok(ptx) => {
                 if !log.is_empty() {

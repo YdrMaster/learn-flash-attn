@@ -1,7 +1,7 @@
 ﻿use super::FlashAttnCfg;
 use crate::{attention::Strides2D, softmax::test::safe_softmax};
 use any_tensor::digit_layout::{DigitLayout, types};
-use num_traits::{Float, FromPrimitive};
+use num_traits::{Float, FromPrimitive, ToPrimitive as _, Zero as _};
 use std::{
     iter::{Sum, zip},
     ops::{AddAssign, DivAssign},
@@ -78,7 +78,7 @@ fn test_flash_attention() {
     let cache = cache.as_ref().map(|_| erase_ty(&v_data));
 
     // 计算标准 attention
-    let mut ans = vec![0.; H * N * D];
+    let mut ans = vec![Tdata::zero(); H * N * D];
     let mut cache_ans = cache_data.clone();
     attention::<Tdata>(
         q.as_deref(),
@@ -89,12 +89,14 @@ fn test_flash_attention() {
         P,
     );
 
-    let max_error = 10. * Tdata::EPSILON.sqrt();
+    let max_error =
+        <Tdata as FromPrimitive>::from_f64(10. * Tdata::epsilon().to_f64().unwrap().sqrt())
+            .unwrap();
     println!("max error: {max_error:e}");
 
     // 计算 flash attention
     {
-        let mut res = vec![0.; H * N * D];
+        let mut res = vec![Tdata::zero(); H * N * D];
         let mut cache_res = cache_data.clone();
         let mut reqs = [Attention {
             q: q.clone(),
@@ -109,13 +111,13 @@ fn test_flash_attention() {
         let max = zip(ans.clone(), res)
             .chain(zip(cache_ans.clone(), cache_res))
             .map(|(ans, res)| (ans - res).abs())
-            .fold(0., Tdata::max);
+            .fold(Tdata::neg_zero(), Tdata::max);
         println!("CPU: max error = {max:e}");
         assert!(max < max_error, "CPU error mismatch")
     }
     #[cfg(cuda)]
     {
-        let mut res = vec![0.; H * N * D];
+        let mut res = vec![Tdata::zero(); H * N * D];
         let mut cache_res = cache_data.clone();
         let mut reqs = [Attention {
             q: q.clone(),
@@ -134,7 +136,7 @@ fn test_flash_attention() {
         let max = zip(ans.clone(), res)
             .chain(zip(cache_ans.clone(), cache_res))
             .map(|(ans, res)| (ans - res).abs())
-            .fold(0., Tdata::max);
+            .fold(Tdata::zero(), Tdata::max);
         println!("GPU: max error = {max:e}");
         assert!(max < max_error, "GPU error mismatch")
     }

@@ -11,6 +11,7 @@ authors = [
 [dependencies]
 rayon = "1.10"
 num-traits = "0.2"
+half = { version = "2.6", features = ["num-traits"] }
 cuda = { git = "https://github.com/YdrMaster/cuda-driver", rev = "803d64b" }
 
 [dev-dependencies]

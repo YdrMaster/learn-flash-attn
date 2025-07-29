@@ -237,6 +237,8 @@ impl super::FlashAttnCfg {
 
         let dt = reqs.iter().map(|req| req.dt()).collect::<Box<_>>();
         match distinct(&dt).unwrap() {
+            types::F16 => self.test_compute_cpu_::<half::f16>(reqs),
+            types::BF16 => self.test_compute_cpu_::<half::bf16>(reqs),
             types::F32 => self.test_compute_cpu_::<f32>(reqs),
             types::F64 => self.test_compute_cpu_::<f64>(reqs),
             others => panic!("Unsupported data type {others}"),

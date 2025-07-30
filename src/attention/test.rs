@@ -1,7 +1,7 @@
 ﻿use super::FlashAttnCfg;
 use crate::{attention::Strides2D, softmax::test::safe_softmax};
 use any_tensor::digit_layout::{DigitLayout, types};
-use num_traits::{Float, FromPrimitive, ToPrimitive as _, Zero as _};
+use num_traits::{Float, FromPrimitive, ToPrimitive, Zero as _};
 use std::{
     iter::{Sum, zip},
     ops::{AddAssign, DivAssign},
@@ -89,9 +89,7 @@ fn test_flash_attention() {
         P,
     );
 
-    let max_error =
-        <Tdata as FromPrimitive>::from_f64(10. * Tdata::epsilon().to_f64().unwrap().sqrt())
-            .unwrap();
+    let max_error = max_error::<Tdata>();
     println!("max error: {max_error:e}");
 
     // 计算 flash attention
@@ -146,6 +144,10 @@ fn random_data<T: Float + FromPrimitive>(n: usize) -> Vec<T> {
     (0..n)
         .map(|_| T::from_f32((rand::random::<f32>() - 0.5) * 10.).unwrap())
         .collect()
+}
+
+fn max_error<T: Float + FromPrimitive + ToPrimitive>() -> T {
+    T::from_f64(10. * T::to_f64(&T::epsilon()).unwrap().sqrt()).unwrap()
 }
 
 /// 连接 cache

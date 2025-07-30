@@ -116,7 +116,7 @@ impl super::FlashAttnCfg {
         stream: &cuda::Stream,
     ) {
         use super::{KVPage, KernelReq, Strides2D};
-        use cuda::Ptx;
+        use cuda::Rtc;
         use std::iter::zip;
 
         // 生成 GPU 版本
@@ -190,17 +190,8 @@ impl super::FlashAttnCfg {
             .collect::<Box<_>>();
         // 编译及计算
         let cc = stream.ctx().dev().compute_capability();
-        let (ptx, log) = Ptx::compile(code::<T>(), cc);
-        let ptx = match ptx {
-            Ok(ptx) => {
-                if !log.is_empty() {
-                    println!("{log}")
-                }
-                ptx
-            }
-            Err(e) => panic!("{e:?}\n{log}"),
-        };
-        let module = stream.ctx().load(&ptx);
+        let program = Rtc::new().arch(cc).compile(&code::<T>()).unwrap();
+        let module = stream.ctx().load(&program);
         self.compute_cuda::<T>(&cache_pages, &reqs_, &module, stream);
 
         for ((.., o, cache, _), c) in zip(reqs_o, reqs) {

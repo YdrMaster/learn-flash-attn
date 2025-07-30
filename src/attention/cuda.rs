@@ -5,26 +5,31 @@ use std::ffi::c_uint;
 pub trait NVDT: Copy {
     const COMPUTE_TYPE_NAME: &str;
     const DATA_TYPE_NAME: &str;
+    const SIZE: usize;
 }
 
 impl NVDT for half::f16 {
     const COMPUTE_TYPE_NAME: &str = "float";
     const DATA_TYPE_NAME: &str = "half";
+    const SIZE: usize = 2;
 }
 
 impl NVDT for half::bf16 {
     const COMPUTE_TYPE_NAME: &str = "float";
     const DATA_TYPE_NAME: &str = "nv_bfloat16";
+    const SIZE: usize = 2;
 }
 
 impl NVDT for f32 {
     const COMPUTE_TYPE_NAME: &str = "float";
     const DATA_TYPE_NAME: &str = "float";
+    const SIZE: usize = 4;
 }
 
 impl NVDT for f64 {
     const COMPUTE_TYPE_NAME: &str = "double";
     const DATA_TYPE_NAME: &str = "double";
+    const SIZE: usize = 8;
 }
 
 impl super::FlashAttnCfg {
@@ -67,12 +72,16 @@ impl super::FlashAttnCfg {
     }
 }
 
-pub fn code<T: NVDT>() -> String {
-    const CODE: &str = include_str!("kernel.cuh");
+pub fn code<T: NVDT>(d: usize, warp: usize) -> String {
+    const CODE: &str = include_str!("cuda/kernel.cu");
     let t_data: &str = T::DATA_TYPE_NAME;
     let t_compute: &str = T::COMPUTE_TYPE_NAME;
+    let ele_size = T::SIZE;
+    let load = gen_load(d, ele_size, warp);
     format!(
-        r#"{CODE}
+        r#"
+{load}
+{CODE}
 
 extern "C" __global__ void cache_concat(
     KernelCfg cfg,
@@ -189,8 +198,10 @@ impl super::FlashAttnCfg {
             })
             .collect::<Box<_>>();
         // 编译及计算
-        let cc = stream.ctx().dev().compute_capability();
-        let program = Rtc::new().arch(cc).compile(&code::<T>()).unwrap();
+        let dev = stream.ctx().dev();
+        let cc = dev.compute_capability();
+        let warp = dev.warp_size();
+        let program = Rtc::new().arch(cc).compile(&code::<T>(64, warp)).unwrap();
         let module = stream.ctx().load(&program);
         self.compute_cuda::<T>(&cache_pages, &reqs_, &module, stream);
 
@@ -200,4 +211,47 @@ impl super::FlashAttnCfg {
                 .memcpy_d2h(c.o.get_mut(), o.get());
         }
     }
+}
+
+fn gen_load(d: usize, ele_size: usize, warp: usize) -> String {
+    const CANDIDATES: &[[&str; 2]] = &[
+        ["char", "0"],
+        ["short", "0"],
+        ["float", ".0f"],
+        ["double", ".0"],
+        ["float4", "float4{0,0,0,0}"],
+        ["double4", "double4{0,0,0,0}"],
+    ];
+
+    let bytes = d * ele_size;
+    let max = (bytes / warp).next_power_of_two().trailing_zeros() as usize;
+    let (i, [t, zero]) = CANDIDATES
+        .iter()
+        .enumerate()
+        .take(max + 1)
+        .rev()
+        .find(|(n, _)| bytes % (1 << n) == 0)
+        .unwrap();
+    let ele_size = 1 << i;
+    let d = bytes / ele_size;
+
+    const CODE: &str = include_str!("cuda/load.cu");
+    format!(
+        r#"{CODE}
+
+__device__ __forceinline__ void load_qo(
+    void *qi,
+    void *oi,
+    void const *q) {{
+    load_qo_<{d}>(({t} *)qi, ({t} *)oi, ({t} const*)q, {zero});
+}}
+
+__device__ __forceinline__ void load_kv(
+    void *kj,
+    void *vj,
+    void const *k,
+    void const *v) {{
+    load_kv_<{d}>(({t} *)kj, ({t} *)vj, ({t} const*)k, ({t} const*)v);
+}}"#
+    )
 }

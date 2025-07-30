@@ -39,6 +39,8 @@ __host__ __device__ __forceinline__ T *byte_offset(T *ptr, ptrdiff_t diff) {
     return (T *)(((char *)ptr) + diff);
 }
 
+// 参数数据类型
+
 struct KernelCfg {
     size_t g, d, bs;
     float scale;
@@ -84,6 +86,8 @@ struct KernelReq {
     bool *const mask;
 };
 
+// 连接 kv cache
+
 // threads (b, kvh) (d)
 template <typename T>
 __device__ void cache_concat_block(
@@ -110,6 +114,8 @@ __device__ void cache_concat_block(
         byte_offset(page.v, c_offset)[it] = byte_offset(req.v, v_offset)[it];
     }
 }
+
+// flash attention 本体
 
 // threads (b, h) (bn, warp)
 template <typename Tcompute, typename T>
@@ -156,10 +162,7 @@ __device__ void flash_attn_block(
         T const *req_q = byte_offset(req.q, req.q_strides.offset(head, iq));
         T /***/ *req_o = byte_offset(req.o, req.o_strides.offset(head, iq));
         if (iq < req.n) {
-            for (size_t i = lane; i < d; i += warp) {
-                qi[i] = req_q[i]; // 加载 qi
-                oi[i] = 0;        // 初始化 oi 为 0
-            }
+            load_qo(qi, oi, req_q);
         }
         // 初始化 m l
         Tcompute mi_1 = neg_inf<Tcompute>(),
@@ -180,12 +183,7 @@ __device__ void flash_attn_block(
                     *v = (cache_pages + req.pages_start + ikvb)->v;
             for (size_t i = it_y; i < bs; i += bn) {
                 ptrdiff_t const offset = req.kv_strides.offset(head / g, i);
-                T const *k_ = byte_offset(k, offset),
-                        *v_ = byte_offset(v, offset);
-                for (size_t j = lane; j < d; j += warp) {
-                    kj[i * d + j] = k_[j];
-                    vj[i * d + j] = v_[j];
-                }
+                load_kv(kj + i * d, vj + i * d, byte_offset(k, offset), byte_offset(v, offset));
             }
             __syncthreads();
             // 每个线程束计算 q 的一行

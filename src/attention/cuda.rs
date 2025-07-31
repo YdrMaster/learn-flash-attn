@@ -41,30 +41,28 @@ impl super::FlashAttnCfg {
         stream: &Stream,
     ) {
         let &Self {
-            h,
-            kvh,
-            d,
-            tile_seq,
-            ..
+            h, kvh, tile_seq, ..
         } = self;
+        let n = reqs.len() as c_uint;
+        let h = h as c_uint;
+        let kvh = kvh as c_uint;
+        let bn = tile_seq as c_uint;
+        let warp = stream.ctx().dev().warp_size() as c_uint;
         // 拷贝参数
         let cache_pages = stream.from_host(cache_pages);
         let reqs_ = stream.from_host(reqs);
         // 发射 kernel
         let params = params![self.to_kernel_cfg(), cache_pages.as_ptr(), reqs_.as_ptr()];
+        let nh_l = *[8, 4, 2, 1].iter().find(|&&n| kvh % n == 0).unwrap();
         stream
             .launch(
                 &module.get_kernel(c"cache_concat"),
-                ((reqs.len() as c_uint, kvh as c_uint), d as c_uint, 0),
+                ((n, kvh / nh_l), (nh_l, warp), 0),
                 &params.to_ptrs(),
             )
             .launch(
                 &module.get_kernel(c"flash_attn"),
-                (
-                    (reqs.len() as c_uint, h as c_uint),
-                    (tile_seq as c_uint, stream.ctx().dev().warp_size() as c_uint),
-                    self.shared_elements() * size_of::<T>(),
-                ),
+                ((n, h), (bn, warp), self.shared_elements() * size_of::<T>()),
                 &params.to_ptrs(),
             )
             .free(reqs_)
@@ -143,7 +141,7 @@ impl super::FlashAttnCfg {
             })
             .collect::<Box<_>>();
 
-        let &Self { tile_ctx, .. } = self;
+        let &Self { d, tile_ctx, .. } = self;
         // 生成所有页指针
         let cache_pages = reqs_o
             .iter()
@@ -201,7 +199,7 @@ impl super::FlashAttnCfg {
         let dev = stream.ctx().dev();
         let cc = dev.compute_capability();
         let warp = dev.warp_size();
-        let program = Rtc::new().arch(cc).compile(&code::<T>(64, warp)).unwrap();
+        let program = Rtc::new().arch(cc).compile(&code::<T>(d, warp)).unwrap();
         let module = stream.ctx().load(&program);
         self.compute_cuda::<T>(&cache_pages, &reqs_, &module, stream);
 
@@ -243,7 +241,7 @@ __device__ __forceinline__ void load_qo(
     void *qi,
     void *oi,
     void const *q) {{
-    load_qo_<{d}>(({t} *)qi, ({t} *)oi, ({t} const*)q, {zero});
+    load_qo_<{d}, {warp}>(({t} *)qi, ({t} *)oi, ({t} const*)q, {zero});
 }}
 
 __device__ __forceinline__ void load_kv(
@@ -251,7 +249,7 @@ __device__ __forceinline__ void load_kv(
     void *vj,
     void const *k,
     void const *v) {{
-    load_kv_<{d}>(({t} *)kj, ({t} *)vj, ({t} const*)k, ({t} const*)v);
+    load_kv_<{d}, {warp}>(({t} *)kj, ({t} *)vj, ({t} const*)k, ({t} const*)v);
 }}"#
     )
 }

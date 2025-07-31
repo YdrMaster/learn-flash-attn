@@ -88,7 +88,7 @@ struct KernelReq {
 
 // 连接 kv cache
 
-// threads (b, kvh) (d)
+// threads (b, kvh.h) (kvh.l, warp)
 template <typename T>
 __device__ void cache_concat_block(
     KernelCfg cfg,
@@ -96,8 +96,13 @@ __device__ void cache_concat_block(
     KernelReq<T> const *reqs) {
     size_t const
         ireq = blockIdx.y,
-        head = blockIdx.x,
-        it = threadIdx.x;
+        // nh_h = gridDim.x,
+        ih_h = blockIdx.x,
+        nh_l = blockDim.y,
+        ih_l = threadIdx.y,
+        head = ih_h * nh_l + ih_l,
+        warp = blockDim.x,
+        lane = threadIdx.x;
 
     KernelReq const req = reqs[ireq];
     KVPage<T> const *pages = cache_pages + req.pages_start;
@@ -110,8 +115,10 @@ __device__ void cache_concat_block(
             k_offset = req.k_strides.offset(head, i),
             v_offset = req.v_strides.offset(head, i),
             c_offset = req.kv_strides.offset(head, (pos + i) % bs);
-        byte_offset(page.k, c_offset)[it] = byte_offset(req.k, k_offset)[it];
-        byte_offset(page.v, c_offset)[it] = byte_offset(req.v, v_offset)[it];
+        load_kv(byte_offset(page.k, c_offset),
+                byte_offset(page.v, c_offset),
+                byte_offset(req.k, k_offset),
+                byte_offset(req.v, v_offset));
     }
 }
 

@@ -124,24 +124,25 @@ __device__ void cache_concat_block(
 
 // flash attention 本体
 
-// threads (b, h) (bn, warp)
+// threads (b, h, bn) (bs, warp)
 template <typename Tcompute, typename T>
 __device__ void flash_attn_block(
     KernelCfg cfg,
     KVPage<T> const *cache_pages,
     KernelReq<T> const *reqs) {
     size_t const
-        ireq = blockIdx.y,
-        head = blockIdx.x,
-        bn = blockDim.y,
-        warp = blockDim.x,
-        it_y = threadIdx.y,
-        lane = threadIdx.x;
+        ireq = blockIdx.z,
+        head = blockIdx.y,
+        q_base = blockIdx.x,
+        bn = gridDim.x,
+        i_warp = threadIdx.y,
+        bs = blockDim.y,
+        lane = threadIdx.x,
+        warp = blockDim.x;
 
     size_t const
         g = cfg.g,
-        d = cfg.d,
-        bs = cfg.bs;
+        d = cfg.d;
     Tcompute const
         scale = cfg.scale;
     KernelReq const
@@ -149,28 +150,24 @@ __device__ void flash_attn_block(
     // 划分 shared memory
     extern __shared__ T shared[];
     T *qi = shared,
-      *oi = qi + bn * d,
-      *kj = oi + bn * d,
+      *oi = qi + d,
+      *kj = oi + d,
       *vj = kj + bs * d,
       *x = vj + bs * d;
-    // 定位每个线程的 qi, oi, x
-    qi += it_y * d;
-    oi += it_y * d;
-    x += it_y * bs;
 
     size_t const
         ikvb_end = div_ceil(req.s, bs),
         iqb_end = div_ceil(req.n, bn);
     // seq 方向迭代
-    for (size_t iqb = 0; iqb < iqb_end; ++iqb) {
-        size_t const
-            iq = iqb * bn + it_y,
-            causal_end = req.ty == AttnType::Causal ? req.s - req.n + iq : (size_t)-1;
+    for (size_t iq = q_base; iq < req.n; iq += bn) {
+        size_t const causal_end = req.ty == AttnType::Causal ? req.s - req.n + iq : (size_t)-1;
         T const *req_q = byte_offset(req.q, req.q_strides.offset(head, iq));
         T /***/ *req_o = byte_offset(req.o, req.o_strides.offset(head, iq));
-        if (iq < req.n) {
-            load_qo(qi, oi, req_q);
+        for (size_t i = i_warp * warp + lane; i < d; i += bs * warp) {
+            qi[i] = req_q[i];
+            oi[i] = 0;
         }
+        __syncthreads();
         // 初始化 m l
         Tcompute mi_1 = neg_inf<Tcompute>(),
                  di_1 = 1e-6; // 避免除 0
@@ -184,78 +181,70 @@ __device__ void flash_attn_block(
                 kv_base + bs > causal_end
                     ? causal_end - kv_base + 1
                     : bs;
-
             // 每个线程拷贝 k/v 的一行，拷贝整个 kv block 到 local memory
             T const *k = (cache_pages + req.pages_start + ikvb)->k,
                     *v = (cache_pages + req.pages_start + ikvb)->v;
-            for (size_t i = it_y; i < bs; i += bn) {
-                ptrdiff_t const offset = req.kv_strides.offset(head / g, i);
-                load_kv(kj + i * d, vj + i * d, byte_offset(k, offset), byte_offset(v, offset));
+            ptrdiff_t const offset = req.kv_strides.offset(head / g, i_warp);
+            load_kv(kj + i_warp * d, vj + i_warp * d, byte_offset(k, offset), byte_offset(v, offset));
+            __syncthreads();
+            //
+            bool const *mask = req.mask + iq * ikvb_end * bs + kv_base;
+            Tcompute mi = mi_1, sum = 0;
+            // score = q @ k^T / √d
+            {
+                Tcompute qk = 0;
+                for (size_t j = lane; j < d; j += warp) {
+                    fma_<Tcompute>(qi[j], kj[i_warp * d + j], qk);
+                }
+                using WarpReduce = cub::WarpReduce<Tcompute>;
+                __shared__ typename WarpReduce::TempStorage temp_storage;
+                qk = WarpReduce(temp_storage).Sum(qk, d);
+                if (lane == 0) {
+                    x[i_warp] = qk * scale;
+                }
             }
             __syncthreads();
-            // 每个线程束计算 q 的一行
-            if (iq < req.n) {
-                bool const *mask = req.mask + iq * ikvb_end * bs + kv_base;
-                Tcompute mi = mi_1, sum = 0;
-                // score = q @ k^T / √d
-                for (size_t i = 0; i < s_end; ++i) {
-                    if (req.ty == AttnType::CustomMask && !mask[i]) {
+            // max
+            for (size_t i = 0; i < s_end; ++i) {
+                if (mi < (Tcompute)x[i]) {
+                    mi = (Tcompute)x[i];
+                }
+            }
+            // score = exp(score - max)
+            if (lane == 0) {
+                x[i_warp] = ::exp((Tcompute)x[i_warp] - mi);
+            }
+            __syncthreads();
+            // sum
+            for (size_t i = 0; i < s_end; ++i) {
+                if (req.ty == AttnType::CustomMask && !mask[i]) {
+                    continue;
+                }
+                sum += (Tcompute)x[i];
+            }
+            Tcompute const exp = ::exp(mi_1 - mi);
+            // 更新 m, l
+            mi_1 = mi;
+            di_1 = di_1 * exp + sum;
+            // score = score * v
+            for (size_t i = lane; i < d; i += warp) {
+                Tcompute xv = 0;
+                for (size_t j = 0; j < bs; ++j) {
+                    if (j >= s_end || (req.ty == AttnType::CustomMask && !mask[i])) {
                         continue;
                     }
-
-                    Tcompute qk = 0;
-                    for (size_t j = lane; j < d; j += warp) {
-                        fma_<Tcompute>(qi[j], kj[i * d + j], qk);
-                    }
-                    {
-                        using WarpReduce = cub::WarpReduce<Tcompute>;
-                        __shared__ typename WarpReduce::TempStorage temp_storage;
-                        qk = __shfl_sync(0xFFFFFFFF, WarpReduce(temp_storage).Sum(qk, d), 0);
-                        __syncwarp();
-                    }
-                    qk *= scale;
-                    if (lane == 0) {
-                        x[i] = qk;
-                    }
-                    if (mi < qk) {
-                        mi = qk;
-                    }
+                    fma_<Tcompute>(x[j], vj[j * d + i], xv);
                 }
-                for (size_t i = 0; i < s_end; ++i) {
-                    if (req.ty == AttnType::CustomMask && !mask[i]) {
-                        continue;
-                    }
-
-                    Tcompute exp = ::exp((Tcompute)x[i] - mi);
-                    sum += exp;
-                    if (lane == 0) {
-                        x[i] = exp;
-                    }
-                }
-
-                Tcompute const exp = ::exp(mi_1 - mi);
-                // 更新 m, l
-                mi_1 = mi;
-                di_1 = di_1 * exp + sum;
-                for (size_t i = lane; i < d; i += warp) {
-                    Tcompute xv = 0;
-                    for (size_t j = 0; j < s_end; ++j) {
-                        if (req.ty == AttnType::CustomMask && !mask[j]) {
-                            continue;
-                        }
-                        fma_<Tcompute>(x[j], vj[j * d + i], xv);
-                    }
+                if (i_warp == 0) {
                     oi[i] = (Tcompute)oi[i] * exp + xv;
                 }
             }
             __syncthreads();
         }
         // 将 oi 写入 o
-        if (iq < req.n) {
-            Tcompute k = 1 / di_1;
-            for (size_t i = lane; i < d; i += warp) {
-                req_o[i] = (Tcompute)oi[i] * k;
-            }
+        Tcompute k = 1 / di_1;
+        for (size_t i = i_warp * warp + lane; i < d; i += bs * warp) {
+            req_o[i] = (Tcompute)oi[i] * k;
         }
     }
 }

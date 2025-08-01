@@ -41,12 +41,17 @@ impl super::FlashAttnCfg {
         stream: &Stream,
     ) {
         let &Self {
-            h, kvh, tile_seq, ..
+            h,
+            kvh,
+            d,
+            tile_seq,
+            tile_ctx,
         } = self;
         let n = reqs.len() as c_uint;
         let h = h as c_uint;
         let kvh = kvh as c_uint;
         let bn = tile_seq as c_uint;
+        let bs = tile_ctx as c_uint;
         let warp = stream.ctx().dev().warp_size() as c_uint;
         // 拷贝参数
         let cache_pages = stream.from_host(cache_pages);
@@ -54,6 +59,15 @@ impl super::FlashAttnCfg {
         // 发射 kernel
         let params = params![self.to_kernel_cfg(), cache_pages.as_ptr(), reqs_.as_ptr()];
         let nh_l = *[8, 4, 2, 1].iter().find(|&&n| kvh % n == 0).unwrap();
+        let shared = [
+            d,            // qi
+            d,            // oi
+            tile_ctx * d, // kj
+            tile_ctx * d, // vj
+            tile_ctx,     // x
+        ]
+        .iter()
+        .sum::<usize>();
         stream
             .launch(
                 &module.get_kernel(c"cache_concat"),
@@ -62,7 +76,7 @@ impl super::FlashAttnCfg {
             )
             .launch(
                 &module.get_kernel(c"flash_attn"),
-                ((n, h), (bn, warp), self.shared_elements() * size_of::<T>()),
+                ((n, h, bn), (bs, warp), shared * size_of::<T>()),
                 &params.to_ptrs(),
             )
             .free(reqs_)
@@ -213,10 +227,10 @@ impl super::FlashAttnCfg {
 
 fn gen_load(d: usize, ele_size: usize, warp: usize) -> String {
     const CANDIDATES: &[[&str; 2]] = &[
-        ["char", "0"],
-        ["short", "0"],
-        ["float", ".0f"],
-        ["double", ".0"],
+        ["char", "(char)0"],
+        ["short", "(short)0"],
+        ["float", "(float)0"],
+        ["double", "(double)0"],
         ["float4", "float4{0,0,0,0}"],
         ["double4", "double4{0,0,0,0}"],
     ];

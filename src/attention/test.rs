@@ -57,8 +57,8 @@ fn test_flash_attention() {
         h: H,
         kvh: KVH,
         d: D,
-        tile_seq: 4,
-        tile_ctx: 32,
+        tile_seq: 32,
+        tile_ctx: 8,
     };
 
     let q = Tensor::from_dim_slice(DT, [H, N, D]);

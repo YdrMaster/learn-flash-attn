@@ -49,6 +49,7 @@ impl super::FlashAttnCfg {
         let bn = tile_seq as c_uint;
         let warp = stream.ctx().dev().warp_size() as c_uint;
         // 拷贝参数
+        let n_max = reqs.iter().map(|req| req.n).max().unwrap() as c_uint;
         let cache_pages = stream.from_host(cache_pages);
         let reqs_ = stream.from_host(reqs);
         // 发射 kernel
@@ -62,7 +63,11 @@ impl super::FlashAttnCfg {
             )
             .launch(
                 &module.get_kernel(c"flash_attn"),
-                ((n, h), (bn, warp), self.shared_elements() * size_of::<T>()),
+                (
+                    (n, h, n_max.div_ceil(bn)),
+                    (bn, warp),
+                    self.shared_elements() * size_of::<T>(),
+                ),
                 &params.to_ptrs(),
             )
             .free(reqs_)

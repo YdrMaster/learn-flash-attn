@@ -124,19 +124,18 @@ __device__ void cache_concat_block(
 
 // flash attention 本体
 
-// threads (b, h) (bn, warp)
+// threads (b, h, bn_y) (bn_x, warp)
 template <typename Tcompute, typename T>
 __device__ void flash_attn_block(
     KernelCfg cfg,
     KVPage<T> const *cache_pages,
     KernelReq<T> const *reqs) {
     size_t const
-        ireq = blockIdx.y,
-        head = blockIdx.x,
-        bn = blockDim.y,
-        warp = blockDim.x,
-        it_y = threadIdx.y,
-        lane = threadIdx.x;
+        ireq = blockIdx.z,
+        head = blockIdx.y,
+        iq_y = blockIdx.x, bn_y = gridDim.x,
+        iq_x = threadIdx.y, bn_x = blockDim.y,
+        lane = threadIdx.x, warp = blockDim.x;
 
     size_t const
         g = cfg.g,
@@ -149,22 +148,22 @@ __device__ void flash_attn_block(
     // 划分 shared memory
     extern __shared__ T shared[];
     T *qi = shared,
-      *oi = qi + bn * d,
-      *kj = oi + bn * d,
+      *oi = qi + bn_x * d,
+      *kj = oi + bn_x * d,
       *vj = kj + bs * d,
       *x = vj + bs * d;
     // 定位每个线程的 qi, oi, x
-    qi += it_y * d;
-    oi += it_y * d;
-    x += it_y * bs;
+    qi += iq_x * d;
+    oi += iq_x * d;
+    x += iq_x * bs;
 
     size_t const
         ikvb_end = div_ceil(req.s, bs),
-        iqb_end = div_ceil(req.n, bn);
+        iqb_end = div_ceil(req.n, bn_x);
     // seq 方向迭代
-    for (size_t iqb = 0; iqb < iqb_end; ++iqb) {
+    for (size_t iqb = iq_y; iqb < iqb_end; iqb += bn_y) {
         size_t const
-            iq = iqb * bn + it_y,
+            iq = iqb * bn_x + iq_x,
             causal_end = req.ty == AttnType::Causal ? req.s - req.n + iq : (size_t)-1;
         T const *req_q = byte_offset(req.q, req.q_strides.offset(head, iq));
         T /***/ *req_o = byte_offset(req.o, req.o_strides.offset(head, iq));
@@ -188,7 +187,7 @@ __device__ void flash_attn_block(
             // 每个线程拷贝 k/v 的一行，拷贝整个 kv block 到 local memory
             T const *k = (cache_pages + req.pages_start + ikvb)->k,
                     *v = (cache_pages + req.pages_start + ikvb)->v;
-            for (size_t i = it_y; i < bs; i += bn) {
+            for (size_t i = iq_x; i < bs; i += bn_x) {
                 ptrdiff_t const offset = req.kv_strides.offset(head / g, i);
                 load_kv(kj + i * d, vj + i * d, byte_offset(k, offset), byte_offset(v, offset));
             }

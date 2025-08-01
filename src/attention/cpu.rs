@@ -17,21 +17,22 @@ impl super::FlashAttnCfg {
         } = self;
         // 发射 kernel
         let cfg = self.to_kernel_cfg();
-        launch_parallel(reqs.len(), kvh, |ireq, head| {
+        launch_parallel(1, reqs.len(), kvh, |[_, ireq, head]| {
             cache_concat_block(cfg, cache_pages, reqs, ireq, head)
         });
-        launch_parallel(reqs.len(), h, |ireq, head| {
+        launch_parallel(reqs.len(), h, tile_seq, |indices| {
             let mut shared = vec![T::zero(); self.shared_elements()];
-            flash_attn_block(cfg, cache_pages, reqs, ireq, head, tile_seq, &mut shared)
+            flash_attn_block(cfg, cache_pages, reqs, indices, tile_seq, &mut shared)
         });
     }
 }
 
-fn launch_parallel(y: usize, x: usize, f: impl Fn(usize, usize) + Sync) {
-    (0..y)
+fn launch_parallel(z: usize, y: usize, x: usize, f: impl Fn([usize; 3]) + Sync) {
+    (0..z)
         .into_par_iter()
-        .flat_map(|y| (0..x).into_par_iter().map(move |x| [y, x]))
-        .for_each(|[y, x]| f(y, x))
+        .flat_map(|z| (0..y).into_par_iter().map(move |y| [z, y]))
+        .flat_map(|[z, y]| (0..x).into_par_iter().map(move |x| [z, y, x]))
+        .for_each(&f)
 }
 
 fn cache_concat_block<T: Copy>(
@@ -73,11 +74,11 @@ fn flash_attn_block<T: Float + FromPrimitive + AddAssign + Sum<T>>(
     cfg: KernelCfg,
     cache_pages: &[KVPage<T>],
     reqs: &[KernelReq<T>],
-    ireq: usize,
-    head: usize,
+    indices: [usize; 3],
     bn: usize,
     shared: &mut [T],
 ) {
+    let [ireq, head, q_base] = indices;
     let KernelCfg { g, d, bs, scale } = cfg;
     let scale = T::from_f32(scale).unwrap();
     let &KernelReq {
@@ -95,136 +96,98 @@ fn flash_attn_block<T: Float + FromPrimitive + AddAssign + Sum<T>>(
     } = &reqs[ireq];
     let pages = &cache_pages[pages_start..][..s.div_ceil(bs)];
     // 划分 shared memory
-    let (qi, shared) = shared.split_at_mut(bn * d);
-    let (oi, shared) = shared.split_at_mut(bn * d);
+    let (qi, shared) = shared.split_at_mut(d);
+    let (oi, shared) = shared.split_at_mut(d);
     let (kj, shared) = shared.split_at_mut(bs * d);
     let (vj, x) = shared.split_at_mut(bs * d);
-    assert_eq!(x.len(), bn * bs);
+    assert_eq!(x.len(), bs);
     // seq 方向迭代
-    for iqb in 0..n.div_ceil(bn) {
-        // 每个线程拷贝 q 的一行，拷贝整个 q block 到 local memory
-        for it_y in 0..bn {
-            for it_x in 0..d {
-                let iq = iqb * bn + it_y;
-                if iq >= n {
-                    break;
-                }
-                // locate data
-                let qi_ = unsafe { from_raw_parts(q.byte_offset(q_strides.offset(head, iq)), d) };
-                // load data
-                qi[it_y * d + it_x] = qi_[it_x];
-                // 初始化 oi 为 0
-                oi[it_y * d + it_x] = T::zero()
-            }
-        }
+    for iq in (q_base..n).step_by(bn) {
+        let q = unsafe { from_raw_parts(q.byte_offset(q_strides.offset(head, iq)), d) };
+        let o = unsafe { from_raw_parts_mut(o.byte_offset(o_strides.offset(head, iq)), d) };
+        // load q/o
+        qi.copy_from_slice(q);
+        oi.fill(T::zero());
         // 初始化 m l
-        let mut mi_t = vec![T::neg_infinity(); bn].into_boxed_slice();
-        let mut di_t = vec![T::zero(); bn].into_boxed_slice();
+        let mut mi_1 = T::neg_infinity();
+        let mut di_1 = T::zero();
         // ctx 方向迭代
         for (ikvb, KVPage { k, v }) in pages.iter().enumerate() {
             // 每个线程拷贝 k/v 的一行，拷贝整个 kv block 到 local memory
-            for it_y in 0..bn {
-                for it_x in 0..d {
-                    for i in (it_y..bs).step_by(bn) {
-                        let offset = kv_strides.offset(head / g, i);
-                        kj[i * d + it_x] = unsafe { k.byte_offset(offset).add(it_x).read() };
-                        vj[i * d + it_x] = unsafe { v.byte_offset(offset).add(it_x).read() };
+            for i in 0..bs {
+                let offset = kv_strides.offset(head / g, i);
+                kj[i * d..][..d]
+                    .copy_from_slice(unsafe { from_raw_parts(k.byte_offset(offset), d) });
+                vj[i * d..][..d]
+                    .copy_from_slice(unsafe { from_raw_parts(v.byte_offset(offset), d) });
+            }
+            // 计算当前线程 qi oi x 对应的索引
+            let mask = unsafe { from_raw_parts(mask.add((iq * pages.len() + ikvb) * bs), bs) };
+
+            // 用于计算 mask
+            let pos = s - n;
+            let kv_pos_base = ikvb * bs;
+
+            // score = q @ k^T / √d
+            let mut mi = mi_1;
+            for (i, (mask, x)) in zip(mask, &mut *x).enumerate() {
+                let is_valid = match ty {
+                    AttnType::Full => true,
+                    AttnType::Causal => kv_pos_base + i <= pos + iq,
+                    AttnType::CustomMask => *mask,
+                };
+
+                if is_valid {
+                    let qk = zip(&*qi, &kj[i * d..][..d])
+                        .map(|(&q, &k)| q * k)
+                        .sum::<T>()
+                        * scale;
+                    *x = qk;
+                    if qk > mi {
+                        mi = qk
                     }
                 }
             }
-            // 每个线程计算 q 的一行
-            for it_y in 0..bn {
-                for it_x in 0..d {
-                    let iq = iqb * bn + it_y;
-                    if iq >= n {
-                        break;
-                    }
-                    // 计算当前线程 qi oi x 对应的索引
-                    let qi = &mut qi[it_y * d..][..d];
-                    let oi = &mut oi[it_y * d..][..d];
-                    let x = &mut x[it_y * bs..][..bs];
 
-                    let mask =
-                        unsafe { from_raw_parts(mask.add((iq * pages.len() + ikvb) * bs), bs) };
+            let mut sum = T::zero();
+            for (i, (mask, x)) in zip(mask, &mut *x).enumerate() {
+                let is_valid = match ty {
+                    AttnType::Full => true,
+                    AttnType::Causal => kv_pos_base + i <= pos + iq,
+                    AttnType::CustomMask => *mask,
+                };
 
-                    // 初始化 mi_1, di_1
-                    let mi_1 = &mut mi_t[it_y];
-                    let di_1 = &mut di_t[it_y];
-
-                    if it_x > 0 {
-                        continue;
-                    }
-
-                    // 用于计算 mask
-                    let pos = s - n;
-                    let kv_pos_base = ikvb * bs;
-
-                    // score = q @ k^T / √d
-                    let mut mi = *mi_1;
-                    for (i, (mask, x)) in zip(mask, &mut *x).enumerate() {
-                        let is_valid = match ty {
-                            AttnType::Full => true,
-                            AttnType::Causal => kv_pos_base + i <= pos + iq,
-                            AttnType::CustomMask => *mask,
-                        };
-
-                        if is_valid {
-                            let qk = zip(&*qi, &kj[i * d..][..d])
-                                .map(|(&q, &k)| q * k)
-                                .sum::<T>()
-                                * scale;
-                            *x = qk;
-                            if qk > mi {
-                                mi = qk
-                            }
-                        }
-                    }
-
-                    let mut sum = T::zero();
-                    for (i, (mask, x)) in zip(mask, &mut *x).enumerate() {
-                        let is_valid = match ty {
-                            AttnType::Full => true,
-                            AttnType::Causal => kv_pos_base + i <= pos + iq,
-                            AttnType::CustomMask => *mask,
-                        };
-
-                        if !is_valid {
-                            *x = T::zero()
-                        } else {
-                            *x = (*x - mi).exp();
-                            sum += *x
-                        }
-                    }
-
-                    let exp = (*mi_1 - mi).exp();
-                    let exp_mut_di_1 = *di_1 * exp;
-                    let di = exp_mut_di_1 + sum;
-                    // 更新 m, l
-                    *mi_1 = mi;
-                    *di_1 = di;
-
-                    for (j, oi) in oi.iter_mut().enumerate() {
-                        let xv = x
-                            .iter()
-                            .enumerate()
-                            .map(|(i, x)| *x * vj[i * d + j])
-                            .sum::<T>();
-                        *oi = *oi * exp + xv
-                    }
+                if !is_valid {
+                    *x = T::zero()
+                } else {
+                    *x = (*x - mi).exp();
+                    sum += *x
                 }
+            }
+
+            let exp = (mi_1 - mi).exp();
+            let di = di_1 * exp + sum;
+            // 更新 m, l
+            mi_1 = mi;
+            di_1 = di;
+            for (j, oi) in oi.iter_mut().enumerate() {
+                let xv = x
+                    .iter()
+                    .enumerate()
+                    .filter(|&(i, _)| match ty {
+                        AttnType::Full => true,
+                        AttnType::Causal => kv_pos_base + i <= pos + iq,
+                        AttnType::CustomMask => mask[i],
+                    })
+                    .map(|(i, x)| *x * vj[i * d + j])
+                    .sum::<T>();
+                *oi = *oi * exp + xv
             }
         }
-
-        for it_y in 0..bn {
-            for it_x in 0..d {
-                let iq = iqb * bn + it_y;
-                if iq >= n {
-                    break;
-                }
-                let o = unsafe { from_raw_parts_mut(o.byte_offset(o_strides.offset(head, iq)), d) };
-                // 将 oi 写入 o
-                o[it_x] = oi[it_y * d + it_x] / di_t[it_y]
-            }
+        // 将 oi 写入 o
+        let k = di_1.recip();
+        for (o, oi) in zip(o, &mut *oi) {
+            *o = *oi * k
         }
     }
 }

@@ -62,7 +62,7 @@ impl super::FlashAttnCfg {
             )
             .launch(
                 &module.get_kernel(c"flash_attn"),
-                ((n, h), (bn, warp), self.shared_elements() * size_of::<T>()),
+                ((n, h, bn), warp, self.shared_elements() * size_of::<T>()),
                 &params.to_ptrs(),
             )
             .free(reqs_)
@@ -213,10 +213,10 @@ impl super::FlashAttnCfg {
 
 fn gen_load(d: usize, ele_size: usize, warp: usize) -> String {
     const CANDIDATES: &[[&str; 2]] = &[
-        ["char", "0"],
-        ["short", "0"],
-        ["float", ".0f"],
-        ["double", ".0"],
+        ["char", "(char)0"],
+        ["short", "(short)0"],
+        ["float", "(float)0"],
+        ["double", "(double)0"],
         ["float4", "float4{0,0,0,0}"],
         ["double4", "double4{0,0,0,0}"],
     ];

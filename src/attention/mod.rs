@@ -91,18 +91,13 @@ impl FlashAttnCfg {
     }
 
     pub fn shared_elements(&self) -> usize {
-        let &Self {
-            d,
-            tile_seq,
-            tile_ctx,
-            ..
-        } = self;
+        let &Self { d, tile_ctx, .. } = self;
         [
-            tile_seq * d,        // qi
-            tile_seq * d,        // oi
-            tile_ctx * d,        // kj
-            tile_ctx * d,        // vj
-            tile_seq * tile_ctx, // x
+            d,            // qi
+            d,            // oi
+            tile_ctx * d, // kj
+            tile_ctx * d, // vj
+            tile_ctx,     // x
         ]
         .iter()
         .sum()

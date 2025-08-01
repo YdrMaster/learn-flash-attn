@@ -62,7 +62,11 @@ impl super::FlashAttnCfg {
             )
             .launch(
                 &module.get_kernel(c"flash_attn"),
-                ((n, h, bn), warp, self.shared_elements() * size_of::<T>()),
+                (
+                    (n, h, bn),
+                    (8, warp),
+                    self.shared_elements() * size_of::<T>(),
+                ),
                 &params.to_ptrs(),
             )
             .free(reqs_)

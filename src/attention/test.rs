@@ -48,7 +48,7 @@ fn test_flash_attention() {
 
     const H: usize = 32;
     const KVH: usize = 8;
-    const N: usize = 7;
+    const N: usize = 31;
     const S: usize = 1000;
     const P: usize = S - N;
     const D: usize = 64;
@@ -57,7 +57,7 @@ fn test_flash_attention() {
         h: H,
         kvh: KVH,
         d: D,
-        tile_seq: 4,
+        tile_seq: 32,
         tile_ctx: 32,
     };
 
